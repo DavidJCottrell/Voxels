@@ -36,7 +36,8 @@ public class VoxelWorld : ModuleRules
             new string[]
             {
                 "Slate",
-                "SlateCore"
+                "SlateCore",
+                "EnhancedInput"
             }
         );
 
@@ -49,7 +50,7 @@ public class VoxelWorld : ModuleRules
 
         // Enable SIMD optimizations
         bUseUnity = false;
-        
+
         // Enable multithreading support
         bEnableExceptions = true;
     }

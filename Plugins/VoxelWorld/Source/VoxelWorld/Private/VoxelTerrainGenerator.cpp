@@ -35,38 +35,31 @@ float UVoxelTerrainGenerator::GetPlateauInfluence(int32 WorldX, int32 WorldY) co
 
     float BiomeScale = WorldSettings.BiomeSettings.BiomeScale;
 
-    // Use Voronoi-like noise for distinct plateau regions
-    float CellX, CellY;
-    float VoronoiDist = NoiseGenerator->GetVoronoiNoise2D(
-        WorldX * BiomeScale * 0.5f,
-        WorldY * BiomeScale * 0.5f,
-        CellX, CellY
-    );
+    // REMOVED: Voronoi noise was causing the pillar artifacts at cell boundaries
+    // Instead, use multiple octaves of fractal noise for smooth, organic edges
 
-    // Large-scale plateau regions
-    float PlateauNoise = NoiseGenerator->GetFractalNoise2D(
+    // Primary plateau shape - large scale
+    float PlateauNoise1 = NoiseGenerator->GetFractalNoise2D(
         WorldX * BiomeScale + 10000.0f,
         WorldY * BiomeScale + 10000.0f,
         2, 0.5f, 2.0f
     );
 
-    // Combine: plateaus form where noise is high and we're not at voronoi edges
-    float PlateauFactor = PlateauNoise;
+    // Secondary noise for edge variation - prevents perfectly round plateaus
+    float PlateauNoise2 = NoiseGenerator->GetFractalNoise2D(
+        WorldX * BiomeScale * 2.0f + 15000.0f,
+        WorldY * BiomeScale * 2.0f + 15000.0f,
+        2, 0.5f, 2.0f
+    );
 
-    // Create distinct plateau regions
-    if (PlateauFactor > 0.55f)
-    {
-        // Sharp transition to plateau
-        float Influence = FMath::SmoothStep(0.55f, 0.65f, PlateauFactor);
+    // Combine noises - primary determines plateau presence, secondary adds edge detail
+    float CombinedNoise = PlateauNoise1 * 0.7f + PlateauNoise2 * 0.3f;
 
-        // Reduce influence at edges (voronoi boundaries create natural cliff edges)
-        float EdgeFalloff = FMath::Clamp(VoronoiDist * 3.0f, 0.0f, 1.0f);
-        Influence *= EdgeFalloff;
+    // Wide, smooth transition for natural cliff edges
+    // Plateaus form where combined noise > 0.45
+    float Influence = FMath::SmoothStep(0.45f, 0.65f, CombinedNoise);
 
-        return Influence;
-    }
-
-    return 0.0f;
+    return Influence;
 }
 
 float UVoxelTerrainGenerator::GetValleyInfluence(int32 WorldX, int32 WorldY) const
@@ -75,27 +68,29 @@ float UVoxelTerrainGenerator::GetValleyInfluence(int32 WorldX, int32 WorldY) con
 
     float BiomeScale = WorldSettings.BiomeSettings.BiomeScale;
 
-    // Valley paths using ridged noise (creates natural river-like valleys)
+    // Valley paths using ridged noise
+    // CHANGED: Reduced frequency multiplier from 1.5 to 0.8 for WIDER valleys
     float ValleyNoise = NoiseGenerator->GetRidgedNoise2D(
-        WorldX * BiomeScale * 1.5f + 20000.0f,
-        WorldY * BiomeScale * 1.5f + 20000.0f,
+        WorldX * BiomeScale * 0.8f + 20000.0f,  // Was 1.5f - now wider
+        WorldY * BiomeScale * 0.8f + 20000.0f,
         3, 0.5f, 2.0f
     );
 
     // Secondary noise for valley variation
     float ValleyVar = NoiseGenerator->GetFractalNoise2D(
-        WorldX * BiomeScale * 3.0f + 25000.0f,
-        WorldY * BiomeScale * 3.0f + 25000.0f,
+        WorldX * BiomeScale * 2.0f + 25000.0f,
+        WorldY * BiomeScale * 2.0f + 25000.0f,
         2, 0.5f, 2.0f
     );
 
     // Valleys form in the ridges of ridged noise (inverted)
     float ValleyFactor = 1.0f - ValleyNoise;
 
-    // Only deep valleys where factor is high
-    if (ValleyFactor > 0.6f)
+    // CHANGED: Higher threshold (0.65 instead of 0.6) = fewer, wider valleys
+    // Wider smoothstep range (0.65 to 0.85 instead of 0.6 to 0.8) = smoother edges
+    if (ValleyFactor > 0.65f)
     {
-        float Influence = FMath::SmoothStep(0.6f, 0.8f, ValleyFactor);
+        float Influence = FMath::SmoothStep(0.65f, 0.85f, ValleyFactor);
 
         // Vary valley depth
         Influence *= FMath::Lerp(0.6f, 1.0f, ValleyVar);
@@ -112,7 +107,7 @@ float UVoxelTerrainGenerator::GetCanyonInfluence(int32 WorldX, int32 WorldY) con
 
     float BiomeScale = WorldSettings.BiomeSettings.BiomeScale;
 
-    // Canyons: narrow, deep cuts using domain-warped noise
+    // Domain warping for winding canyon paths
     float WarpX = NoiseGenerator->GetFractalNoise2D(
         WorldX * BiomeScale * 2.0f + 30000.0f,
         WorldY * BiomeScale * 2.0f + 30000.0f,
@@ -125,17 +120,17 @@ float UVoxelTerrainGenerator::GetCanyonInfluence(int32 WorldX, int32 WorldY) con
         2, 0.5f, 2.0f
     ) * 50.0f;
 
-    // Warped ridge noise creates winding canyon paths
+    // CHANGED: Reduced frequency from 4.0 to 2.0 for WIDER canyons
     float CanyonNoise = NoiseGenerator->GetRidgedNoise2D(
-        (WorldX + WarpX) * BiomeScale * 4.0f,
-        (WorldY + WarpY) * BiomeScale * 4.0f,
+        (WorldX + WarpX) * BiomeScale * 2.0f,  // Was 4.0f - now wider
+        (WorldY + WarpY) * BiomeScale * 2.0f,
         2, 0.6f, 2.0f
     );
 
-    // Narrow canyon threshold
-    if (CanyonNoise > 0.85f)
+    // CHANGED: Higher threshold (0.88 instead of 0.85) = fewer, wider canyons
+    if (CanyonNoise > 0.88f)
     {
-        return FMath::SmoothStep(0.85f, 0.95f, CanyonNoise);
+        return FMath::SmoothStep(0.88f, 0.95f, CanyonNoise);
     }
 
     return 0.0f;
@@ -188,10 +183,14 @@ float UVoxelTerrainGenerator::GetPeaksValleys(int32 WorldX, int32 WorldY) const
     if (!NoiseGenerator) return 0.5f;
 
     float Frequency = WorldSettings.NoiseFrequency * 2.0f;
+
+    // CHANGED: Reduced octaves from 4 to 3, reduced persistence for smoother ridges
     return NoiseGenerator->GetRidgedNoise2D(
         WorldX * Frequency + 2000.0f,
         WorldY * Frequency + 2000.0f,
-        4, 0.5f, 2.0f
+        3,      // Was 4 - fewer octaves = smoother
+        0.4f,   // Was 0.5f - lower persistence = less sharp detail
+        2.0f
     );
 }
 
@@ -311,8 +310,6 @@ EBiomeType UVoxelTerrainGenerator::GetBiome(int32 WorldX, int32 WorldY) const
 
 float UVoxelTerrainGenerator::GetFeatureHeight(int32 WorldX, int32 WorldY) const
 {
-    float BaseHeight = WorldSettings.BaseTerrainHeight;
-
     // Get feature influences
     float PlateauInf = GetPlateauInfluence(WorldX, WorldY);
     float ValleyInf = GetValleyInfluence(WorldX, WorldY);
@@ -320,10 +317,12 @@ float UVoxelTerrainGenerator::GetFeatureHeight(int32 WorldX, int32 WorldY) const
 
     float FeatureHeight = 0.0f;
 
-    // Plateau: raises terrain with flat top
+    // CHANGED: Plateau height multiplier increased from 1.0x to 2.0x
+    // This makes plateaus significantly taller
     if (PlateauInf > 0.0f)
     {
-        float PlateauTop = WorldSettings.BiomeSettings.PlateauHeight;
+        // Use 2x the configured PlateauHeight for more dramatic plateaus
+        float PlateauTop = WorldSettings.BiomeSettings.PlateauHeight * 2.0f;
         FeatureHeight += PlateauInf * PlateauTop;
     }
 
@@ -365,14 +364,14 @@ float UVoxelTerrainGenerator::GetTerrainHeight(int32 WorldX, int32 WorldY) const
     // Apply peaks and valleys
     float TerrainVariation = (PeaksValleys - 0.5f) * WorldSettings.TerrainAmplitude * ErosionMultiplier;
 
-    // Add detail noise
+    // CHANGED: Reduced detail noise significantly to prevent thin spots
     float DetailNoise = NoiseGenerator->GetFractalNoise2D(
         WorldX * WorldSettings.NoiseFrequency * 4.0f,
         WorldY * WorldSettings.NoiseFrequency * 4.0f,
         WorldSettings.NoiseOctaves,
         0.5f, 2.0f
     );
-    float DetailVariation = (DetailNoise - 0.5f) * 8.0f;
+    float DetailVariation = (DetailNoise - 0.5f) * 2.0f;  // Was 8.0f - reduced to 2.0f
 
     // Combine base terrain
     float FinalHeight = BaseHeight + ContinentHeight + TerrainVariation + DetailVariation;
@@ -386,18 +385,18 @@ float UVoxelTerrainGenerator::GetTerrainHeight(int32 WorldX, int32 WorldY) const
     if (PlateauInf > 0.5f)
     {
         float Flatness = WorldSettings.BiomeSettings.PlateauFlatness;
-        float PlateauTop = BaseHeight + WorldSettings.BiomeSettings.PlateauHeight;
+        float PlateauTop = BaseHeight + WorldSettings.BiomeSettings.PlateauHeight * 2.0f;
 
         // Flatten the top
         float FlattenedHeight = FMath::Lerp(FinalHeight, PlateauTop, Flatness * PlateauInf);
 
-        // Add small variation to plateau tops
+        // CHANGED: Reduced plateau top variation to prevent thin spots
         float TopVariation = NoiseGenerator->GetFractalNoise2D(
             WorldX * WorldSettings.NoiseFrequency * 8.0f + 15000.0f,
             WorldY * WorldSettings.NoiseFrequency * 8.0f + 15000.0f,
             2, 0.5f, 2.0f
         );
-        FlattenedHeight += (TopVariation - 0.5f) * 3.0f * (1.0f - Flatness);
+        FlattenedHeight += (TopVariation - 0.5f) * 1.0f * (1.0f - Flatness);  // Was 3.0f
 
         FinalHeight = FlattenedHeight;
     }
@@ -579,78 +578,31 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
     float TerrainDensity = (float)WorldZ - TerrainHeight;
 
     // =========================================
-    // FIX 1: Safer 3D variation application
+    // NO 3D variation - it causes holes
     // =========================================
-    // Only apply 3D variation well below the surface to prevent thin spots
-    float DepthFromSurface = TerrainHeight - WorldZ;
-
-    if (DepthFromSurface > 3.0f)  // Only apply variation 3+ voxels below surface
-    {
-        float Variation3D = Get3DTerrainVariation(WorldX, WorldY, WorldZ);
-
-        // Gradual ramp-in of variation (none at depth 3, full at depth 20+)
-        float VariationStrength = FMath::Clamp((DepthFromSurface - 3.0f) / 17.0f, 0.0f, 1.0f) * 0.5f;
-
-        // CRITICAL: Only allow variation to make terrain MORE solid, not less
-        // This prevents holes from forming near the surface
-        if (Variation3D < 0.0f)  // Negative = more solid
-        {
-            TerrainDensity += Variation3D * VariationStrength;
-        }
-        else if (DepthFromSurface > 10.0f)  // Only allow "air pockets" deep underground
-        {
-            TerrainDensity += Variation3D * VariationStrength * 0.5f;  // Reduced strength
-        }
-    }
 
     // =========================================
-    // FIX 2: Safer plateau cliff handling
+    // Cave generation (conservative settings)
     // =========================================
-    float PlateauInf = GetPlateauInfluence(WorldX, WorldY);
-    if (PlateauInf > 0.1f && PlateauInf < 0.9f)
-    {
-        float CliffSteepness = WorldSettings.BiomeSettings.CliffSteepness;
-        float EdgeFactor = 1.0f - FMath::Abs(PlateauInf - 0.5f) * 2.0f;
-
-        if (EdgeFactor > 0.3f)
-        {
-            // FIX: Don't multiply - use additive steepening instead
-            // This prevents sign flipping and maintains density continuity
-            float SteepnessAddition = CliffSteepness * EdgeFactor * FMath::Sign(TerrainDensity);
-
-            // Only steepen if we're clearly solid or clearly air
-            if (FMath::Abs(TerrainDensity) > 0.1f)
-            {
-                TerrainDensity += SteepnessAddition * 0.1f;
-            }
-        }
-    }
-
-    // =========================================
-    // FIX 3: Safer cave generation
-    // =========================================
-    // Increase surface margin and add density threshold check
-    const float CaveSurfaceMargin = 10.0f;  // Increased from 5.0f
-    const float CaveDensityThreshold = -0.3f;  // Only carve into clearly solid terrain
+    const float CaveSurfaceMargin = 20.0f;  // Very conservative
+    const float CaveDensityThreshold = -0.8f;  // Only carve very solid areas
 
     if (WorldSettings.bGenerateCaves &&
         WorldZ < TerrainHeight - CaveSurfaceMargin &&
-        WorldZ > 2 &&
-        TerrainDensity < CaveDensityThreshold)  // NEW: Only carve solid terrain
+        WorldZ > 3 &&
+        TerrainDensity < CaveDensityThreshold)
     {
         float CaveDensity = GetCaveDensity(WorldX, WorldY, WorldZ);
 
         if (CaveDensity > 0.0f)
         {
-            // FIX: Blend caves more smoothly instead of hard max
-            // This creates smoother cave walls and prevents sharp transitions
             float CaveBlend = FMath::SmoothStep(0.0f, 0.5f, CaveDensity);
             TerrainDensity = FMath::Lerp(TerrainDensity, CaveDensity, CaveBlend);
         }
     }
 
     // =========================================
-    // Bedrock layer (unchanged)
+    // Bedrock layer
     // =========================================
     if (WorldZ <= 0)
     {
@@ -662,31 +614,35 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
         TerrainDensity = FMath::Min(TerrainDensity, FMath::Lerp(TerrainDensity, -10.0f, BedrockBlend));
     }
 
-    // Water handling (unchanged)
-    EBiomeType Biome = GetBiome(WorldX, WorldY);
-    if (Biome == EBiomeType::Ocean || Biome == EBiomeType::DeepValley)
-    {
-        float WaterLevel = WorldSettings.BaseTerrainHeight - 5;
-        if (Biome == EBiomeType::DeepValley)
-        {
-            float ValleyInf = GetValleyInfluence(WorldX, WorldY);
-            WaterLevel = WorldSettings.BaseTerrainHeight - WorldSettings.BiomeSettings.ValleyDepth * ValleyInf + 2;
-        }
-    }
-
     // =========================================
-    // FIX 4: Prevent paper-thin terrain
+    // BULLETPROOF THICKNESS CHECK
     // =========================================
-    // If density is very close to zero but should be solid, push it more solid
-    const float MinSolidThickness = 0.05f;
-    if (TerrainDensity < 0.0f && TerrainDensity > -MinSolidThickness)
+    // Apply a large minimum before normalization
+    const float MinSolidThicknessPreNorm = 1.0f;  // Increased from 0.5f
+    if (TerrainDensity < 0.0f && TerrainDensity > -MinSolidThicknessPreNorm)
     {
-        // We have paper-thin terrain - thicken it
-        TerrainDensity = -MinSolidThickness;
+        TerrainDensity = -MinSolidThicknessPreNorm;
     }
 
     // Normalize density
     TerrainDensity = FMath::Clamp(TerrainDensity / 5.0f, -1.0f, 1.0f);
+
+    // =========================================
+    // POST-NORMALIZATION SAFETY CHECK
+    // If density is barely positive (0 to 0.1) but we're clearly
+    // below where terrain should be, force it solid
+    // =========================================
+    if (TerrainDensity > -0.15f && TerrainDensity < 0.15f)
+    {
+        // We're right at the surface boundary - this is where holes happen
+        // Check if we SHOULD be solid based on raw height
+        float RawDensity = (float)WorldZ - TerrainHeight;
+        if (RawDensity < -0.5f)
+        {
+            // We're clearly below terrain surface, force solid
+            TerrainDensity = -0.2f;
+        }
+    }
 
     return TerrainDensity;
 }

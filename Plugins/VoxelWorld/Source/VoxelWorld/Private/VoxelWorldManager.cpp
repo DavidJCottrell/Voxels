@@ -1066,3 +1066,11 @@ void AVoxelWorldManager::ForceCleanup()
 
     UE_LOG(LogVoxelWorld, Log, TEXT("ForceCleanup complete - Memory usage: %.2f MB"), GetMemoryUsageMB());
 }
+
+void AVoxelWorldManager::QueueChunkForRebuild(AVoxelChunk* Chunk)
+{
+    if (Chunk && IsValid(Chunk) && !MeshBuildQueue.Contains(Chunk))
+    {
+        MeshBuildQueue.Add(Chunk);
+    }
+}

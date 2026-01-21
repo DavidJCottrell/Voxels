@@ -139,6 +139,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Voxel World|Performance")
     void ForceCleanup();
 
+    UFUNCTION(BlueprintCallable, Category = "Voxel World")
+    void QueueChunkForRebuild(AVoxelChunk* Chunk);
+
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
