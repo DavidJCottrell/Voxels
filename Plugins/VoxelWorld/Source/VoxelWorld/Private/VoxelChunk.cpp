@@ -322,7 +322,17 @@ float AVoxelChunk::GetDensityIncludingNeighbors(int32 LocalX, int32 LocalY, int3
     if (LocalZ < 0 && NeighborZNeg.IsValid())
         return NeighborZNeg->GetDensity(LocalX, LocalY, LocalZ + ChunkSize);
 
-    return 1.0f;
+    // FIX: Instead of returning 1.0f (air), generate the density
+    // This prevents holes at chunk boundaries when neighbors aren't loaded
+    if (TerrainGenerator)
+    {
+        int32 WorldX = ChunkCoord.X * ChunkSize + LocalX;
+        int32 WorldY = ChunkCoord.Y * ChunkSize + LocalY;
+        int32 WorldZ = ChunkCoord.Z * ChunkSize + LocalZ;
+        return TerrainGenerator->GetDensity(WorldX, WorldY, WorldZ);
+    }
+
+    return 1.0f;  // Fallback only if no terrain generator
 }
 
 EVoxelType AVoxelChunk::GetMaterialIncludingNeighbors(int32 LocalX, int32 LocalY, int32 LocalZ) const

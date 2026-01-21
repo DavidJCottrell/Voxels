@@ -522,16 +522,16 @@ float UVoxelTerrainGenerator::BlendTerrainFeatures(int32 WorldX, int32 WorldY, i
 
 float UVoxelTerrainGenerator::GetCaveDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const
 {
-    if (!WorldSettings.bGenerateCaves || !NoiseGenerator) return 1.0f;
+    if (!WorldSettings.bGenerateCaves || !NoiseGenerator) return -1.0f;
 
     float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
 
     // Don't generate caves near surface or at bedrock
-    if (WorldZ > TerrainHeight - 5 || WorldZ < 3) return 1.0f;
+    if (WorldZ > TerrainHeight - 5 || WorldZ < 3) return -1.0f;
 
     // Reduce caves in plateau areas (solid rock)
     float PlateauInf = GetPlateauInfluence(WorldX, WorldY);
-    if (PlateauInf > 0.7f) return 1.0f;
+    if (PlateauInf > 0.7f) return -1.0f;
 
     float CaveFrequency = WorldSettings.NoiseFrequency * 3.0f;
     float CaveNoise = NoiseGenerator->GetFractalNoise3D(
@@ -575,41 +575,83 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
     // Get terrain height at this XY position
     float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
 
-    // Basic terrain density
+    // Basic terrain density (SDF: negative = solid, positive = air)
     float TerrainDensity = (float)WorldZ - TerrainHeight;
 
-    // Add 3D variation for more interesting terrain
-    float Variation3D = Get3DTerrainVariation(WorldX, WorldY, WorldZ);
+    // =========================================
+    // FIX 1: Safer 3D variation application
+    // =========================================
+    // Only apply 3D variation well below the surface to prevent thin spots
     float DepthFromSurface = TerrainHeight - WorldZ;
-    float VariationStrength = FMath::Clamp(DepthFromSurface / 20.0f, 0.0f, 1.0f) * 0.5f;
-    TerrainDensity += Variation3D * VariationStrength;
 
-    // Apply plateau cliff walls
+    if (DepthFromSurface > 3.0f)  // Only apply variation 3+ voxels below surface
+    {
+        float Variation3D = Get3DTerrainVariation(WorldX, WorldY, WorldZ);
+
+        // Gradual ramp-in of variation (none at depth 3, full at depth 20+)
+        float VariationStrength = FMath::Clamp((DepthFromSurface - 3.0f) / 17.0f, 0.0f, 1.0f) * 0.5f;
+
+        // CRITICAL: Only allow variation to make terrain MORE solid, not less
+        // This prevents holes from forming near the surface
+        if (Variation3D < 0.0f)  // Negative = more solid
+        {
+            TerrainDensity += Variation3D * VariationStrength;
+        }
+        else if (DepthFromSurface > 10.0f)  // Only allow "air pockets" deep underground
+        {
+            TerrainDensity += Variation3D * VariationStrength * 0.5f;  // Reduced strength
+        }
+    }
+
+    // =========================================
+    // FIX 2: Safer plateau cliff handling
+    // =========================================
     float PlateauInf = GetPlateauInfluence(WorldX, WorldY);
     if (PlateauInf > 0.1f && PlateauInf < 0.9f)
     {
-        // At plateau edge - create steep cliffs
         float CliffSteepness = WorldSettings.BiomeSettings.CliffSteepness;
-        float EdgeFactor = 1.0f - FMath::Abs(PlateauInf - 0.5f) * 2.0f; // Max at 0.5
+        float EdgeFactor = 1.0f - FMath::Abs(PlateauInf - 0.5f) * 2.0f;
 
         if (EdgeFactor > 0.3f)
         {
-            // Steepen the terrain at edges
-            TerrainDensity *= (1.0f + CliffSteepness * EdgeFactor);
+            // FIX: Don't multiply - use additive steepening instead
+            // This prevents sign flipping and maintains density continuity
+            float SteepnessAddition = CliffSteepness * EdgeFactor * FMath::Sign(TerrainDensity);
+
+            // Only steepen if we're clearly solid or clearly air
+            if (FMath::Abs(TerrainDensity) > 0.1f)
+            {
+                TerrainDensity += SteepnessAddition * 0.1f;
+            }
         }
     }
 
-    // Apply caves
-    if (WorldSettings.bGenerateCaves && WorldZ < TerrainHeight - 5 && WorldZ > 2)
+    // =========================================
+    // FIX 3: Safer cave generation
+    // =========================================
+    // Increase surface margin and add density threshold check
+    const float CaveSurfaceMargin = 10.0f;  // Increased from 5.0f
+    const float CaveDensityThreshold = -0.3f;  // Only carve into clearly solid terrain
+
+    if (WorldSettings.bGenerateCaves &&
+        WorldZ < TerrainHeight - CaveSurfaceMargin &&
+        WorldZ > 2 &&
+        TerrainDensity < CaveDensityThreshold)  // NEW: Only carve solid terrain
     {
         float CaveDensity = GetCaveDensity(WorldX, WorldY, WorldZ);
+
         if (CaveDensity > 0.0f)
         {
-            TerrainDensity = FMath::Max(TerrainDensity, CaveDensity);
+            // FIX: Blend caves more smoothly instead of hard max
+            // This creates smoother cave walls and prevents sharp transitions
+            float CaveBlend = FMath::SmoothStep(0.0f, 0.5f, CaveDensity);
+            TerrainDensity = FMath::Lerp(TerrainDensity, CaveDensity, CaveBlend);
         }
     }
 
-    // Bedrock layer
+    // =========================================
+    // Bedrock layer (unchanged)
+    // =========================================
     if (WorldZ <= 0)
     {
         TerrainDensity = -10.0f;
@@ -620,12 +662,11 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
         TerrainDensity = FMath::Min(TerrainDensity, FMath::Lerp(TerrainDensity, -10.0f, BedrockBlend));
     }
 
-    // Water handling
+    // Water handling (unchanged)
     EBiomeType Biome = GetBiome(WorldX, WorldY);
     if (Biome == EBiomeType::Ocean || Biome == EBiomeType::DeepValley)
     {
         float WaterLevel = WorldSettings.BaseTerrainHeight - 5;
-        // Valley water level is lower
         if (Biome == EBiomeType::DeepValley)
         {
             float ValleyInf = GetValleyInfluence(WorldX, WorldY);
@@ -633,11 +674,23 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
         }
     }
 
+    // =========================================
+    // FIX 4: Prevent paper-thin terrain
+    // =========================================
+    // If density is very close to zero but should be solid, push it more solid
+    const float MinSolidThickness = 0.05f;
+    if (TerrainDensity < 0.0f && TerrainDensity > -MinSolidThickness)
+    {
+        // We have paper-thin terrain - thicken it
+        TerrainDensity = -MinSolidThickness;
+    }
+
     // Normalize density
     TerrainDensity = FMath::Clamp(TerrainDensity / 5.0f, -1.0f, 1.0f);
 
     return TerrainDensity;
 }
+
 
 // ==========================================
 // Material Selection
