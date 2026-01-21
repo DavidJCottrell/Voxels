@@ -360,7 +360,7 @@ float FVoxelMarchingCubes::GetDensity(
             return DensityData[Index];
         }
     }
-    
+
     // Get from neighbor
     return GetNeighborDensity(X, Y, Z);
 }
@@ -377,11 +377,11 @@ FVector FVoxelMarchingCubes::InterpolateVertex(
         return P2;
     if (FMath::Abs(D1 - D2) < SMALL_NUMBER)
         return P1;
-    
+
     // Linear interpolation to find surface crossing point
     float T = (SurfaceLevel - D1) / (D2 - D1);
     T = FMath::Clamp(T, 0.0f, 1.0f);
-    
+
     return P1 + T * (P2 - P1);
 }
 
@@ -392,16 +392,16 @@ FVector FVoxelMarchingCubes::CalculateNormal(
 ) const
 {
     // Calculate gradient using central differences
-    float GradX = GetDensity(DensityData, GetNeighborDensity, X + 1, Y, Z) - 
+    float GradX = GetDensity(DensityData, GetNeighborDensity, X + 1, Y, Z) -
                   GetDensity(DensityData, GetNeighborDensity, X - 1, Y, Z);
-    float GradY = GetDensity(DensityData, GetNeighborDensity, X, Y + 1, Z) - 
+    float GradY = GetDensity(DensityData, GetNeighborDensity, X, Y + 1, Z) -
                   GetDensity(DensityData, GetNeighborDensity, X, Y - 1, Z);
-    float GradZ = GetDensity(DensityData, GetNeighborDensity, X, Y, Z + 1) - 
+    float GradZ = GetDensity(DensityData, GetNeighborDensity, X, Y, Z + 1) -
                   GetDensity(DensityData, GetNeighborDensity, X, Y, Z - 1);
-    
+
     FVector Normal(-GradX, -GradY, -GradZ);
     Normal.Normalize();
-    
+
     return Normal;
 }
 
@@ -420,7 +420,7 @@ EVoxelType FVoxelMarchingCubes::GetDominantMaterial(
             return MaterialData[Index];
         }
     }
-    
+
     return GetNeighborMaterial(X, Y, Z);
 }
 
@@ -446,17 +446,17 @@ void FVoxelMarchingCubes::GenerateMesh(
                 // Get density values at the 8 corners of this cell
                 float Densities[8];
                 FVector Corners[8];
-                
+
                 for (int32 i = 0; i < 8; ++i)
                 {
                     int32 CX = X + CornerOffsets[i].X;
                     int32 CY = Y + CornerOffsets[i].Y;
                     int32 CZ = Z + CornerOffsets[i].Z;
-                    
+
                     Densities[i] = GetDensity(DensityData, GetNeighborDensity, CX, CY, CZ);
                     Corners[i] = FVector(CX, CY, CZ) * VoxelSize;
                 }
-                
+
                 // Determine cube configuration (which corners are inside the surface)
                 int32 CubeIndex = 0;
                 for (int32 i = 0; i < 8; ++i)
@@ -466,20 +466,20 @@ void FVoxelMarchingCubes::GenerateMesh(
                         CubeIndex |= (1 << i);
                     }
                 }
-                
+
                 // Skip if entirely inside or outside
                 if (EdgeTable[CubeIndex] == 0)
                 {
                     continue;
                 }
-                
+
                 // Get material for this cell
                 EVoxelType CellMaterial = GetDominantMaterial(MaterialData, GetNeighborMaterial, X, Y, Z);
                 FColor VertexColor = GetVoxelColor(CellMaterial);
-                
+
                 // Find vertices where surface intersects cube edges
                 FVector EdgeVertices[12];
-                
+
                 if (EdgeTable[CubeIndex] & 1)
                     EdgeVertices[0] = InterpolateVertex(Corners[0], Corners[1], Densities[0], Densities[1]);
                 if (EdgeTable[CubeIndex] & 2)
@@ -504,38 +504,40 @@ void FVoxelMarchingCubes::GenerateMesh(
                     EdgeVertices[10] = InterpolateVertex(Corners[2], Corners[6], Densities[2], Densities[6]);
                 if (EdgeTable[CubeIndex] & 2048)
                     EdgeVertices[11] = InterpolateVertex(Corners[3], Corners[7], Densities[3], Densities[7]);
-                
+
                 // Generate triangles
                 for (int32 i = 0; TriangleTable[CubeIndex][i] != -1; i += 3)
                 {
                     FVector V0 = EdgeVertices[TriangleTable[CubeIndex][i]];
                     FVector V1 = EdgeVertices[TriangleTable[CubeIndex][i + 1]];
                     FVector V2 = EdgeVertices[TriangleTable[CubeIndex][i + 2]];
-                    
+
                     // Calculate face normal
+                    // Note: We negate because our density convention (negative = solid)
+                    // combined with Unreal's left-handed coordinate system requires flipped normals
                     FVector Edge1 = V1 - V0;
                     FVector Edge2 = V2 - V0;
-                    FVector FaceNormal = FVector::CrossProduct(Edge1, Edge2).GetSafeNormal();
-                    
+                    FVector FaceNormal = -FVector::CrossProduct(Edge1, Edge2).GetSafeNormal();
+
                     // Calculate smooth normals using gradient at each vertex position
                     // For simplicity, we use the face normal here, but you could interpolate
                     // gradient-based normals for even smoother results
-                    
+
                     int32 VertexStart = OutMeshData.Vertices.Num();
-                    
+
                     // Add vertices
                     OutMeshData.Vertices.Add(V0);
                     OutMeshData.Vertices.Add(V1);
                     OutMeshData.Vertices.Add(V2);
-                    
+
                     // Add normals
                     OutMeshData.Normals.Add(FaceNormal);
                     OutMeshData.Normals.Add(FaceNormal);
                     OutMeshData.Normals.Add(FaceNormal);
-                    
+
                     // Add UVs (triplanar-style based on normal)
                     FVector2D UV0, UV1, UV2;
-                    if (FMath::Abs(FaceNormal.Z) > FMath::Abs(FaceNormal.X) && 
+                    if (FMath::Abs(FaceNormal.Z) > FMath::Abs(FaceNormal.X) &&
                         FMath::Abs(FaceNormal.Z) > FMath::Abs(FaceNormal.Y))
                     {
                         // Top/bottom facing - use XY
@@ -557,22 +559,22 @@ void FVoxelMarchingCubes::GenerateMesh(
                         UV1 = FVector2D(V1.X / VoxelSize, V1.Z / VoxelSize);
                         UV2 = FVector2D(V2.X / VoxelSize, V2.Z / VoxelSize);
                     }
-                    
+
                     OutMeshData.UVs.Add(UV0);
                     OutMeshData.UVs.Add(UV1);
                     OutMeshData.UVs.Add(UV2);
-                    
+
                     // Add colors
                     OutMeshData.VertexColors.Add(VertexColor);
                     OutMeshData.VertexColors.Add(VertexColor);
                     OutMeshData.VertexColors.Add(VertexColor);
-                    
+
                     // Calculate tangent
                     FVector Tangent = Edge1.GetSafeNormal();
                     OutMeshData.Tangents.Add(FProcMeshTangent(Tangent, false));
                     OutMeshData.Tangents.Add(FProcMeshTangent(Tangent, false));
                     OutMeshData.Tangents.Add(FProcMeshTangent(Tangent, false));
-                    
+
                     // Add triangle indices
                     OutMeshData.Triangles.Add(VertexStart);
                     OutMeshData.Triangles.Add(VertexStart + 1);
