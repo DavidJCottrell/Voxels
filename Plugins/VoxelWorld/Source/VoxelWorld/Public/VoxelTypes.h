@@ -342,8 +342,8 @@ struct VOXELWORLD_API FVoxelWorldSettings
     int32 RenderDistance = 64;
 
     /** Maximum world height in chunks */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "World", meta = (ClampMin = "1", ClampMax = "16"))
-    int32 WorldHeightChunks = 4;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "World", meta = (ClampMin = "1", ClampMax = "24"))
+    int32 WorldHeightChunks = 16;
 
     /** Seed for procedural generation */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Generation")
@@ -351,7 +351,7 @@ struct VOXELWORLD_API FVoxelWorldSettings
 
     /** Base terrain height */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Generation", meta = (ClampMin = "1", ClampMax = "256"))
-    int32 BaseTerrainHeight = 64;
+    int32 BaseTerrainHeight = 96;
 
     /** Terrain amplitude (height variation) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Generation", meta = (ClampMin = "1", ClampMax = "128"))

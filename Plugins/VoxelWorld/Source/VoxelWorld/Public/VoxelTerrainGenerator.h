@@ -12,7 +12,7 @@ class UVoxelNoiseGenerator;
 /**
  * Terrain generator for voxel worlds using Signed Distance Fields
  * Produces smooth terrain data for Marching Cubes mesh generation
- * Features: Plateaus, Deep Valleys, Canyons, and varied biomes
+ * Features: Plateaus, Deep Valleys, Canyons, Cave Entrances, and varied biomes
  */
 UCLASS(BlueprintType, Blueprintable, EditInlineNew, DefaultToInstanced)
 class VOXELWORLD_API UVoxelTerrainGenerator : public UObject
@@ -82,6 +82,22 @@ public:
     /** Get canyon influence at position */
     UFUNCTION(BlueprintCallable, Category = "Terrain|Biome")
     float GetCanyonInfluence(int32 WorldX, int32 WorldY) const;
+
+    // ==========================================
+    // Cave Entrance System
+    // ==========================================
+
+    /** Get cave entrance influence at position (0-1, determines if this XY is an entrance location) */
+    UFUNCTION(BlueprintCallable, Category = "Terrain|Caves")
+    float GetCaveEntranceInfluence(int32 WorldX, int32 WorldY) const;
+
+    /** Check if position is inside a cave entrance shaft */
+    UFUNCTION(BlueprintCallable, Category = "Terrain|Caves")
+    bool IsInCaveEntrance(int32 WorldX, int32 WorldY, int32 WorldZ) const;
+
+    /** Get the entrance shaft density (for carving entrance tunnels) */
+    UFUNCTION(BlueprintCallable, Category = "Terrain|Caves")
+    float GetEntranceShaftDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const;
 
     /** Check if a chunk is likely to be empty (for optimization) */
     UFUNCTION(BlueprintCallable, Category = "Terrain|Optimization")

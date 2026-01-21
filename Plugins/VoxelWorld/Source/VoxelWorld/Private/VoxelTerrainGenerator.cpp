@@ -19,7 +19,7 @@ void UVoxelTerrainGenerator::Initialize(const FVoxelWorldSettings& Settings)
     // Clear any cached values
     CachedBiomeNoise.Empty();
 
-    UE_LOG(LogVoxelWorld, Log, TEXT("Terrain generator initialized with seed: %d, Plateaus: %s, Valleys: %s"),
+    UE_LOG(LogVoxelWorld, Log, TEXT("Terrain generator initialized with seed: %d, Plateaus: %s, Valleys: %s, Cave Entrances: ON"),
         Settings.Seed,
         Settings.BiomeSettings.bEnablePlateaus ? TEXT("ON") : TEXT("OFF"),
         Settings.BiomeSettings.bEnableValleys ? TEXT("ON") : TEXT("OFF"));
@@ -148,6 +148,127 @@ EBiomeType UVoxelTerrainGenerator::GetTerrainFeature(int32 WorldX, int32 WorldY)
     if (PlateauInf > 0.5f) return EBiomeType::Plateau;
 
     return GetBiome(WorldX, WorldY);
+}
+
+// ==========================================
+// Cave Entrance System
+// ==========================================
+
+float UVoxelTerrainGenerator::GetCaveEntranceInfluence(int32 WorldX, int32 WorldY) const
+{
+    if (!NoiseGenerator || !WorldSettings.bGenerateCaves) return 0.0f;
+
+    // Don't place entrances on plateaus (they'd just be holes in the plateau)
+    float PlateauInf = GetPlateauInfluence(WorldX, WorldY);
+    if (PlateauInf > 0.5f) return 0.0f;
+
+    // Use ridged noise to create natural ravine-like entrance shapes
+    // Low frequency = sparse, well-separated entrances
+    float EntranceFreq = WorldSettings.NoiseFrequency * 1.2f; // was 0.4f
+
+    // Primary entrance noise - determines main entrance locations
+    float EntranceNoise1 = NoiseGenerator->GetRidgedNoise2D(
+        WorldX * EntranceFreq + 50000.0f,
+        WorldY * EntranceFreq + 50000.0f,
+        2, 0.6f, 2.0f
+    );
+
+    // Secondary noise to break ridges into discrete points
+    float EntranceNoise2 = NoiseGenerator->GetFractalNoise2D(
+        WorldX * EntranceFreq * 2.5f + 55000.0f,
+        WorldY * EntranceFreq * 2.5f + 55000.0f,
+        2, 0.5f, 2.0f
+    );
+
+    // Combine: need both high ridge AND high secondary for entrance
+    float Combined = EntranceNoise1 * 0.6f + EntranceNoise2 * 0.4f;
+
+    // Very high threshold = sparse entrances (approximately 1 per 50-100 voxel area)
+    if (Combined > 0.45f) // was 0.80f
+    {
+        float Influence = FMath::SmoothStep(0.80f, 0.92f, Combined);
+
+        // Add some organic shape variation
+        float ShapeNoise = NoiseGenerator->GetFractalNoise2D(
+            WorldX * EntranceFreq * 5.0f + 60000.0f,
+            WorldY * EntranceFreq * 5.0f + 60000.0f,
+            2, 0.5f, 2.0f
+        );
+
+        // Modulate influence for organic entrance shapes
+        Influence *= FMath::Lerp(0.7f, 1.0f, ShapeNoise);
+
+        return Influence;
+    }
+
+    return 0.0f;
+}
+
+bool UVoxelTerrainGenerator::IsInCaveEntrance(int32 WorldX, int32 WorldY, int32 WorldZ) const
+{
+    float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
+    if (EntranceInfluence < 0.15f) return false;
+
+    float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
+
+    // Entrance shaft extends from near surface to cave level
+    float ShaftTop = TerrainHeight - 1.0f;
+    float ShaftBottom = FMath::Max(5.0f, TerrainHeight * 0.25f);
+
+    // Must be within vertical shaft range
+    if (WorldZ > ShaftTop || WorldZ < ShaftBottom) return false;
+
+    // The shaft gets wider as it goes deeper (inverted cone)
+    float DepthRatio = (ShaftTop - WorldZ) / FMath::Max(1.0f, ShaftTop - ShaftBottom);
+    float RequiredInfluence = 0.5f - DepthRatio * 0.3f; // Less influence needed at depth
+
+    return EntranceInfluence > RequiredInfluence;
+}
+
+float UVoxelTerrainGenerator::GetEntranceShaftDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const
+{
+    float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
+    if (EntranceInfluence < 0.1f) return -1.0f; // No entrance here, return solid
+
+    float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
+
+    // Define shaft vertical range
+    float ShaftTop = TerrainHeight - 0.5f;  // Start just below surface for smooth transition
+    float ShaftBottom = FMath::Max(5.0f, TerrainHeight * 0.25f);
+
+    // Outside shaft range
+    if (WorldZ > ShaftTop) return -1.0f;
+    if (WorldZ < ShaftBottom) return -1.0f;
+
+    // Calculate how deep into the shaft we are (0 = top, 1 = bottom)
+    float DepthRatio = (ShaftTop - WorldZ) / FMath::Max(1.0f, ShaftTop - ShaftBottom);
+
+    // The shaft widens as it goes deeper - creates natural-looking entrance
+    // At top: need high influence (0.6) to be inside shaft
+    // At bottom: need lower influence (0.2) to be inside - wider opening
+    float RequiredInfluence = FMath::Lerp(0.55f, 0.15f, DepthRatio);
+
+    // Add vertical variation for organic tunnel walls
+    if (NoiseGenerator)
+    {
+        float WallNoise = NoiseGenerator->GetFractalNoise3D(
+            WorldX * 0.15f + 65000.0f,
+            WorldY * 0.15f + 65000.0f,
+            WorldZ * 0.08f,
+            2, 0.5f, 2.0f
+        );
+        RequiredInfluence += (WallNoise - 0.5f) * 0.1f;
+    }
+
+    // Calculate shaft density (positive = air/carved, negative = solid)
+    if (EntranceInfluence > RequiredInfluence)
+    {
+        // Inside the shaft - return positive density (air)
+        float ShaftStrength = (EntranceInfluence - RequiredInfluence) * 4.0f;
+        return FMath::Min(ShaftStrength, 1.0f);
+    }
+
+    return -1.0f; // Outside shaft - solid
 }
 
 // ==========================================
@@ -525,8 +646,35 @@ float UVoxelTerrainGenerator::GetCaveDensity(int32 WorldX, int32 WorldY, int32 W
 
     float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
 
-    // Don't generate caves near surface or at bedrock
-    if (WorldZ > TerrainHeight - 5 || WorldZ < 3) return -1.0f;
+    // ==========================================
+    // Cave Entrance Shaft
+    // ==========================================
+    float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
+
+    if (EntranceInfluence > 0.1f)
+    {
+        float ShaftDensity = GetEntranceShaftDensity(WorldX, WorldY, WorldZ);
+        if (ShaftDensity > 0.0f)
+        {
+            // We're inside the entrance shaft - return positive density (air)
+            return ShaftDensity;
+        }
+    }
+
+    // ==========================================
+    // Regular Cave Generation
+    // ==========================================
+
+    // Don't generate regular caves near surface or at bedrock
+    // EXCEPTION: Near entrance shafts, allow caves closer to surface for connectivity
+    float SurfaceMargin = 5.0f;
+    if (EntranceInfluence > 0.3f)
+    {
+        // Near entrance: allow caves closer to surface to connect with shaft
+        SurfaceMargin = FMath::Lerp(5.0f, 2.0f, EntranceInfluence);
+    }
+
+    if (WorldZ > TerrainHeight - SurfaceMargin || WorldZ < 3) return -1.0f;
 
     // Reduce caves in plateau areas (solid rock)
     float PlateauInf = GetPlateauInfluence(WorldX, WorldY);
@@ -559,6 +707,26 @@ float UVoxelTerrainGenerator::GetCaveDensity(int32 WorldX, int32 WorldY, int32 W
         AdjustedThreshold -= 0.1f * ValleyInf;
     }
 
+    // ==========================================
+    // Increase cave probability near entrance shafts
+    // This ensures caves connect to the entrance tunnels
+    // ==========================================
+    if (EntranceInfluence > 0.1f)
+    {
+        // Significantly lower threshold near entrances to guarantee caves form
+        float EntranceBoost = EntranceInfluence * 0.25f;
+        AdjustedThreshold -= EntranceBoost;
+
+        // Also boost caves at the bottom of entrance shafts
+        float ShaftBottom = FMath::Max(5.0f, TerrainHeight * 0.25f);
+        if (WorldZ < ShaftBottom + 10)
+        {
+            float BottomBoost = 1.0f - ((WorldZ - ShaftBottom) / 10.0f);
+            BottomBoost = FMath::Max(0.0f, BottomBoost);
+            AdjustedThreshold -= BottomBoost * 0.15f * EntranceInfluence;
+        }
+    }
+
     float CaveDensity = (CombinedNoise - AdjustedThreshold) * 5.0f;
 
     return CaveDensity;
@@ -566,6 +734,13 @@ float UVoxelTerrainGenerator::GetCaveDensity(int32 WorldX, int32 WorldY, int32 W
 
 bool UVoxelTerrainGenerator::IsCave(int32 WorldX, int32 WorldY, int32 WorldZ) const
 {
+    // Check entrance shaft first
+    if (IsInCaveEntrance(WorldX, WorldY, WorldZ))
+    {
+        return true;
+    }
+
+    // Check regular caves
     return GetCaveDensity(WorldX, WorldY, WorldZ) > 0.0f;
 }
 
@@ -578,6 +753,27 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
     float TerrainDensity = (float)WorldZ - TerrainHeight;
 
     // =========================================
+    // Cave Entrance Shaft Carving
+    // Entrances must override normal terrain to create surface openings
+    // =========================================
+    float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
+    if (EntranceInfluence > 0.1f)
+    {
+        float ShaftDensity = GetEntranceShaftDensity(WorldX, WorldY, WorldZ);
+        if (ShaftDensity > 0.0f)
+        {
+            // Carve the entrance shaft through terrain
+            // Use smooth blending for natural-looking entrance
+            float BlendFactor = FMath::SmoothStep(0.0f, 0.5f, ShaftDensity);
+            TerrainDensity = FMath::Lerp(TerrainDensity, ShaftDensity, BlendFactor);
+
+            // Skip other processing for entrance areas - they should be open
+            TerrainDensity = FMath::Clamp(TerrainDensity / 5.0f, -1.0f, 1.0f);
+            return TerrainDensity;
+        }
+    }
+
+    // =========================================
     // NO 3D variation - it causes holes
     // =========================================
 
@@ -587,8 +783,15 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
     const float CaveSurfaceMargin = 20.0f;  // Very conservative
     const float CaveDensityThreshold = -0.8f;  // Only carve very solid areas
 
+    // Adjust cave margin near entrances for connectivity
+    float EffectiveCaveMargin = CaveSurfaceMargin;
+    if (EntranceInfluence > 0.2f)
+    {
+        EffectiveCaveMargin = FMath::Lerp(CaveSurfaceMargin, 5.0f, EntranceInfluence);
+    }
+
     if (WorldSettings.bGenerateCaves &&
-        WorldZ < TerrainHeight - CaveSurfaceMargin &&
+        WorldZ < TerrainHeight - EffectiveCaveMargin &&
         WorldZ > 3 &&
         TerrainDensity < CaveDensityThreshold)
     {
@@ -616,12 +819,15 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
 
     // =========================================
     // BULLETPROOF THICKNESS CHECK
+    // Skip for entrance areas - they need to be hollow
     // =========================================
-    // Apply a large minimum before normalization
-    const float MinSolidThicknessPreNorm = 1.0f;  // Increased from 0.5f
-    if (TerrainDensity < 0.0f && TerrainDensity > -MinSolidThicknessPreNorm)
+    if (EntranceInfluence < 0.3f)
     {
-        TerrainDensity = -MinSolidThicknessPreNorm;
+        const float MinSolidThicknessPreNorm = 1.0f;
+        if (TerrainDensity < 0.0f && TerrainDensity > -MinSolidThicknessPreNorm)
+        {
+            TerrainDensity = -MinSolidThicknessPreNorm;
+        }
     }
 
     // Normalize density
@@ -629,18 +835,17 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
 
     // =========================================
     // POST-NORMALIZATION SAFETY CHECK
-    // If density is barely positive (0 to 0.1) but we're clearly
-    // below where terrain should be, force it solid
+    // Skip for entrance areas
     // =========================================
-    if (TerrainDensity > -0.15f && TerrainDensity < 0.15f)
+    if (EntranceInfluence < 0.3f)
     {
-        // We're right at the surface boundary - this is where holes happen
-        // Check if we SHOULD be solid based on raw height
-        float RawDensity = (float)WorldZ - TerrainHeight;
-        if (RawDensity < -0.5f)
+        if (TerrainDensity > -0.15f && TerrainDensity < 0.15f)
         {
-            // We're clearly below terrain surface, force solid
-            TerrainDensity = -0.2f;
+            float RawDensity = (float)WorldZ - TerrainHeight;
+            if (RawDensity < -0.5f)
+            {
+                TerrainDensity = -0.2f;
+            }
         }
     }
 
@@ -841,7 +1046,7 @@ EVoxelType UVoxelTerrainGenerator::GetVoxelType(int32 WorldX, int32 WorldY, int3
         return EVoxelType::Air;
     }
 
-    // Check for caves
+    // Check for caves (including entrance shafts)
     if (IsCave(WorldX, WorldY, WorldZ))
     {
         return EVoxelType::Air;
