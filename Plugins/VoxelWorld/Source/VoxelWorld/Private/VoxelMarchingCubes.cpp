@@ -351,7 +351,7 @@ float FVoxelMarchingCubes::GetDensity(
     int32 X, int32 Y, int32 Z
 ) const
 {
-    // Check if within chunk bounds (note: density grid is ChunkSize+1)
+    // Check if within chunk bounds (density grid is ChunkSize+1)
     if (X >= 0 && X <= ChunkSize && Y >= 0 && Y <= ChunkSize && Z >= 0 && Z <= ChunkSize)
     {
         int32 Index = GetIndex(X, Y, Z);
@@ -388,16 +388,17 @@ FVector FVoxelMarchingCubes::InterpolateVertex(
 FVector FVoxelMarchingCubes::CalculateNormal(
     const TArray<float>& DensityData,
     TFunction<float(int32, int32, int32)> GetNeighborDensity,
-    int32 X, int32 Y, int32 Z
+    int32 X, int32 Y, int32 Z,
+    int32 StepSize
 ) const
 {
-    // Calculate gradient using central differences
-    float GradX = GetDensity(DensityData, GetNeighborDensity, X + 1, Y, Z) -
-                  GetDensity(DensityData, GetNeighborDensity, X - 1, Y, Z);
-    float GradY = GetDensity(DensityData, GetNeighborDensity, X, Y + 1, Z) -
-                  GetDensity(DensityData, GetNeighborDensity, X, Y - 1, Z);
-    float GradZ = GetDensity(DensityData, GetNeighborDensity, X, Y, Z + 1) -
-                  GetDensity(DensityData, GetNeighborDensity, X, Y, Z - 1);
+    // Calculate gradient using central differences (scaled for LOD)
+    float GradX = GetDensity(DensityData, GetNeighborDensity, X + StepSize, Y, Z) -
+                  GetDensity(DensityData, GetNeighborDensity, X - StepSize, Y, Z);
+    float GradY = GetDensity(DensityData, GetNeighborDensity, X, Y + StepSize, Z) -
+                  GetDensity(DensityData, GetNeighborDensity, X, Y - StepSize, Z);
+    float GradZ = GetDensity(DensityData, GetNeighborDensity, X, Y, Z + StepSize) -
+                  GetDensity(DensityData, GetNeighborDensity, X, Y, Z - StepSize);
 
     FVector Normal(-GradX, -GradY, -GradZ);
     Normal.Normalize();
@@ -424,6 +425,55 @@ EVoxelType FVoxelMarchingCubes::GetDominantMaterial(
     return GetNeighborMaterial(X, Y, Z);
 }
 
+int32 FVoxelMarchingCubes::AddVertex(
+    FVoxelMeshData& OutMeshData,
+    const FVector& Position,
+    const FVector& Normal,
+    const FVector2D& UV,
+    const FColor& Color,
+    const FVector& Tangent,
+    bool bDeduplicate
+)
+{
+    if (bDeduplicate)
+    {
+        // Check if vertex already exists
+        uint64 Hash = HashPosition(Position);
+        int32* ExistingIndex = VertexMap.Find(Hash);
+
+        if (ExistingIndex)
+        {
+            // Return existing vertex index
+            return *ExistingIndex;
+        }
+
+        // Add new vertex
+        int32 NewIndex = OutMeshData.Vertices.Num();
+        VertexMap.Add(Hash, NewIndex);
+
+        OutMeshData.Vertices.Add(Position);
+        OutMeshData.Normals.Add(Normal);
+        OutMeshData.UVs.Add(UV);
+        OutMeshData.VertexColors.Add(Color);
+        OutMeshData.Tangents.Add(FProcMeshTangent(Tangent, false));
+
+        return NewIndex;
+    }
+    else
+    {
+        // No deduplication - just add vertex
+        int32 NewIndex = OutMeshData.Vertices.Num();
+
+        OutMeshData.Vertices.Add(Position);
+        OutMeshData.Normals.Add(Normal);
+        OutMeshData.UVs.Add(UV);
+        OutMeshData.VertexColors.Add(Color);
+        OutMeshData.Tangents.Add(FProcMeshTangent(Tangent, false));
+
+        return NewIndex;
+    }
+}
+
 void FVoxelMarchingCubes::GenerateMesh(
     const TArray<float>& DensityData,
     const TArray<EVoxelType>& MaterialData,
@@ -432,16 +482,39 @@ void FVoxelMarchingCubes::GenerateMesh(
     FVoxelMeshData& OutMeshData
 )
 {
-    OutMeshData.Reset();
-    OutMeshData.Vertices.Reserve(ChunkSize * ChunkSize * ChunkSize);
-    OutMeshData.Triangles.Reserve(ChunkSize * ChunkSize * ChunkSize * 3);
+    // Legacy method - calls LOD version with step size 1
+    GenerateMeshLOD(DensityData, MaterialData, GetNeighborDensity, GetNeighborMaterial, OutMeshData, 1, true);
+}
 
-    // Process each cell in the chunk
-    for (int32 Z = 0; Z < ChunkSize; ++Z)
+void FVoxelMarchingCubes::GenerateMeshLOD(
+    const TArray<float>& DensityData,
+    const TArray<EVoxelType>& MaterialData,
+    TFunction<float(int32, int32, int32)> GetNeighborDensity,
+    TFunction<EVoxelType(int32, int32, int32)> GetNeighborMaterial,
+    FVoxelMeshData& OutMeshData,
+    int32 StepSize,
+    bool bDeduplicateVertices
+)
+{
+    OutMeshData.Reset();
+
+    // Clear vertex map for deduplication
+    VertexMap.Empty();
+
+    // Calculate effective voxel size for LOD
+    float EffectiveVoxelSize = VoxelSize * StepSize;
+
+    // Reserve approximate memory (reduces reallocations)
+    int32 EstimatedVerts = (ChunkSize / StepSize) * (ChunkSize / StepSize) * (ChunkSize / StepSize) / 2;
+    OutMeshData.Vertices.Reserve(EstimatedVerts);
+    OutMeshData.Triangles.Reserve(EstimatedVerts * 3);
+
+    // Process each cell in the chunk at the LOD step size
+    for (int32 Z = 0; Z < ChunkSize; Z += StepSize)
     {
-        for (int32 Y = 0; Y < ChunkSize; ++Y)
+        for (int32 Y = 0; Y < ChunkSize; Y += StepSize)
         {
-            for (int32 X = 0; X < ChunkSize; ++X)
+            for (int32 X = 0; X < ChunkSize; X += StepSize)
             {
                 // Get density values at the 8 corners of this cell
                 float Densities[8];
@@ -449,9 +522,9 @@ void FVoxelMarchingCubes::GenerateMesh(
 
                 for (int32 i = 0; i < 8; ++i)
                 {
-                    int32 CX = X + CornerOffsets[i].X;
-                    int32 CY = Y + CornerOffsets[i].Y;
-                    int32 CZ = Z + CornerOffsets[i].Z;
+                    int32 CX = X + CornerOffsets[i].X * StepSize;
+                    int32 CY = Y + CornerOffsets[i].Y * StepSize;
+                    int32 CZ = Z + CornerOffsets[i].Z * StepSize;
 
                     Densities[i] = GetDensity(DensityData, GetNeighborDensity, CX, CY, CZ);
                     Corners[i] = FVector(CX, CY, CZ) * VoxelSize;
@@ -512,75 +585,53 @@ void FVoxelMarchingCubes::GenerateMesh(
                     FVector V1 = EdgeVertices[TriangleTable[CubeIndex][i + 1]];
                     FVector V2 = EdgeVertices[TriangleTable[CubeIndex][i + 2]];
 
-                    // Calculate face normal
-                    // Note: We negate because our density convention (negative = solid)
-                    // combined with Unreal's left-handed coordinate system requires flipped normals
+                    // Calculate face normal (negated for correct winding)
                     FVector Edge1 = V1 - V0;
                     FVector Edge2 = V2 - V0;
                     FVector FaceNormal = -FVector::CrossProduct(Edge1, Edge2).GetSafeNormal();
 
-                    // Calculate smooth normals using gradient at each vertex position
-                    // For simplicity, we use the face normal here, but you could interpolate
-                    // gradient-based normals for even smoother results
-
-                    int32 VertexStart = OutMeshData.Vertices.Num();
-
-                    // Add vertices
-                    OutMeshData.Vertices.Add(V0);
-                    OutMeshData.Vertices.Add(V1);
-                    OutMeshData.Vertices.Add(V2);
-
-                    // Add normals
-                    OutMeshData.Normals.Add(FaceNormal);
-                    OutMeshData.Normals.Add(FaceNormal);
-                    OutMeshData.Normals.Add(FaceNormal);
-
-                    // Add UVs (triplanar-style based on normal)
+                    // Calculate UVs (triplanar-style)
                     FVector2D UV0, UV1, UV2;
                     if (FMath::Abs(FaceNormal.Z) > FMath::Abs(FaceNormal.X) &&
                         FMath::Abs(FaceNormal.Z) > FMath::Abs(FaceNormal.Y))
                     {
-                        // Top/bottom facing - use XY
-                        UV0 = FVector2D(V0.X / VoxelSize, V0.Y / VoxelSize);
-                        UV1 = FVector2D(V1.X / VoxelSize, V1.Y / VoxelSize);
-                        UV2 = FVector2D(V2.X / VoxelSize, V2.Y / VoxelSize);
+                        UV0 = FVector2D(V0.X / EffectiveVoxelSize, V0.Y / EffectiveVoxelSize);
+                        UV1 = FVector2D(V1.X / EffectiveVoxelSize, V1.Y / EffectiveVoxelSize);
+                        UV2 = FVector2D(V2.X / EffectiveVoxelSize, V2.Y / EffectiveVoxelSize);
                     }
                     else if (FMath::Abs(FaceNormal.X) > FMath::Abs(FaceNormal.Y))
                     {
-                        // Side facing (X dominant) - use YZ
-                        UV0 = FVector2D(V0.Y / VoxelSize, V0.Z / VoxelSize);
-                        UV1 = FVector2D(V1.Y / VoxelSize, V1.Z / VoxelSize);
-                        UV2 = FVector2D(V2.Y / VoxelSize, V2.Z / VoxelSize);
+                        UV0 = FVector2D(V0.Y / EffectiveVoxelSize, V0.Z / EffectiveVoxelSize);
+                        UV1 = FVector2D(V1.Y / EffectiveVoxelSize, V1.Z / EffectiveVoxelSize);
+                        UV2 = FVector2D(V2.Y / EffectiveVoxelSize, V2.Z / EffectiveVoxelSize);
                     }
                     else
                     {
-                        // Side facing (Y dominant) - use XZ
-                        UV0 = FVector2D(V0.X / VoxelSize, V0.Z / VoxelSize);
-                        UV1 = FVector2D(V1.X / VoxelSize, V1.Z / VoxelSize);
-                        UV2 = FVector2D(V2.X / VoxelSize, V2.Z / VoxelSize);
+                        UV0 = FVector2D(V0.X / EffectiveVoxelSize, V0.Z / EffectiveVoxelSize);
+                        UV1 = FVector2D(V1.X / EffectiveVoxelSize, V1.Z / EffectiveVoxelSize);
+                        UV2 = FVector2D(V2.X / EffectiveVoxelSize, V2.Z / EffectiveVoxelSize);
                     }
-
-                    OutMeshData.UVs.Add(UV0);
-                    OutMeshData.UVs.Add(UV1);
-                    OutMeshData.UVs.Add(UV2);
-
-                    // Add colors
-                    OutMeshData.VertexColors.Add(VertexColor);
-                    OutMeshData.VertexColors.Add(VertexColor);
-                    OutMeshData.VertexColors.Add(VertexColor);
 
                     // Calculate tangent
                     FVector Tangent = Edge1.GetSafeNormal();
-                    OutMeshData.Tangents.Add(FProcMeshTangent(Tangent, false));
-                    OutMeshData.Tangents.Add(FProcMeshTangent(Tangent, false));
-                    OutMeshData.Tangents.Add(FProcMeshTangent(Tangent, false));
+
+                    // Add vertices with optional deduplication
+                    int32 Idx0 = AddVertex(OutMeshData, V0, FaceNormal, UV0, VertexColor, Tangent, bDeduplicateVertices);
+                    int32 Idx1 = AddVertex(OutMeshData, V1, FaceNormal, UV1, VertexColor, Tangent, bDeduplicateVertices);
+                    int32 Idx2 = AddVertex(OutMeshData, V2, FaceNormal, UV2, VertexColor, Tangent, bDeduplicateVertices);
 
                     // Add triangle indices
-                    OutMeshData.Triangles.Add(VertexStart);
-                    OutMeshData.Triangles.Add(VertexStart + 1);
-                    OutMeshData.Triangles.Add(VertexStart + 2);
+                    OutMeshData.Triangles.Add(Idx0);
+                    OutMeshData.Triangles.Add(Idx1);
+                    OutMeshData.Triangles.Add(Idx2);
                 }
             }
         }
     }
+
+    // Clear vertex map to free memory
+    VertexMap.Empty();
+
+    // Shrink arrays to actual size
+    OutMeshData.Shrink();
 }

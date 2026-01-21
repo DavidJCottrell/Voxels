@@ -5,17 +5,19 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "VoxelTypes.h"
+#include "HAL/ThreadSafeBool.h"
 #include "VoxelWorldManager.generated.h"
 
 class AVoxelChunk;
 class UVoxelTerrainGenerator;
 
-/** Async task for chunk generation */
+/** Async task for chunk generation - with safe cancellation */
 class FChunkGenerationTask : public FNonAbandonableTask
 {
 public:
-    FChunkGenerationTask(AVoxelChunk* InChunk)
+    FChunkGenerationTask(AVoxelChunk* InChunk, FThreadSafeBool* InCancelFlag)
         : Chunk(InChunk)
+        , CancelFlag(InCancelFlag)
     {
     }
 
@@ -28,11 +30,11 @@ public:
 
 private:
     AVoxelChunk* Chunk;
+    FThreadSafeBool* CancelFlag;
 };
 
 /**
- * Main voxel world manager
- * Handles chunk loading, unloading, and world generation
+ * Main voxel world manager with LOD, collision distance, and memory management
  */
 UCLASS()
 class VOXELWORLD_API AVoxelWorldManager : public AActor
@@ -41,6 +43,7 @@ class VOXELWORLD_API AVoxelWorldManager : public AActor
 
 public:
     AVoxelWorldManager();
+    virtual ~AVoxelWorldManager();
 
     virtual void Tick(float DeltaTime) override;
 
@@ -56,11 +59,11 @@ public:
     // Editor Preview Settings
     // ==========================================
 
-    /** Enable real-time preview in editor (without pressing Play) */
+    /** Enable real-time preview in editor */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Editor Preview")
     bool bEnableEditorPreview = false;
 
-    /** Preview render distance (in chunks) - keep small for editor performance */
+    /** Preview render distance (keep small for editor performance) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Editor Preview", meta = (ClampMin = "1", ClampMax = "8", EditCondition = "bEnableEditorPreview"))
     int32 EditorPreviewDistance = 3;
 
@@ -120,12 +123,26 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Voxel World")
     void GetChunkStats(int32& OutLoadedChunks, int32& OutPendingChunks, int32& OutTotalVoxels) const;
 
+    // ==========================================
+    // Performance Monitoring
+    // ==========================================
+
+    /** Get total memory usage in MB */
+    UFUNCTION(BlueprintCallable, Category = "Voxel World|Performance")
+    float GetMemoryUsageMB() const;
+
+    /** Get number of chunks in pool */
+    UFUNCTION(BlueprintCallable, Category = "Voxel World|Performance")
+    int32 GetPooledChunkCount() const { return ChunkPool.Num(); }
+
+    /** Force garbage collection of unused chunks and memory compaction */
+    UFUNCTION(BlueprintCallable, Category = "Voxel World|Performance")
+    void ForceCleanup();
+
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void OnConstruction(const FTransform& Transform) override;
-
-    /** Allow tick in editor for preview generation */
     virtual bool ShouldTickIfViewportsOnly() const override;
 
 #if WITH_EDITOR
@@ -140,6 +157,10 @@ protected:
     UPROPERTY()
     TMap<FChunkCoord, TObjectPtr<AVoxelChunk>> LoadedChunks;
 
+    /** Pool of reusable chunks */
+    UPROPERTY()
+    TArray<TObjectPtr<AVoxelChunk>> ChunkPool;
+
     /** Queue of chunks waiting to be generated */
     TArray<FChunkCoord> ChunkGenerationQueue;
 
@@ -149,23 +170,47 @@ protected:
     /** Current load center in chunk coordinates */
     FChunkCoord CurrentLoadCenter;
 
+    /** Cancel flag for async tasks - prevents memory leak when stopping */
+    FThreadSafeBool bCancelAsyncTasks;
+
+    /** Timers for periodic updates */
+    float LODUpdateTimer = 0.0f;
+    float CollisionUpdateTimer = 0.0f;
+
+    /** Update intervals */
+    static constexpr float LODUpdateInterval = 0.5f;
+    static constexpr float CollisionUpdateInterval = 0.5f;
+
     /** Is world initialized */
     bool bIsInitialized = false;
 
-    /** Is this an editor preview (not gameplay) */
+    /** Is this an editor preview */
     bool bIsEditorPreview = false;
 
-    /** Create and spawn a new chunk */
-    AVoxelChunk* CreateChunk(const FChunkCoord& ChunkCoord);
+    // ==========================================
+    // Chunk Management
+    // ==========================================
 
-    /** Destroy a chunk */
+    /** Create or get chunk from pool */
+    AVoxelChunk* CreateOrGetChunk(const FChunkCoord& ChunkCoord);
+
+    /** Return chunk to pool or destroy it */
+    void RecycleChunk(const FChunkCoord& ChunkCoord);
+
+    /** Destroy a chunk completely (not pooled) */
     void DestroyChunk(const FChunkCoord& ChunkCoord);
 
-    /** Destroy all chunks */
+    /** Destroy all chunks and clear pools */
     void DestroyAllChunks();
 
-    /** Update which chunks should be loaded based on load center */
+    /** Update chunk loading/unloading based on distance */
     void UpdateChunkLoading();
+
+    /** Update LOD levels for all chunks based on distance */
+    void UpdateChunkLODs();
+
+    /** Update collision states for all chunks based on distance */
+    void UpdateChunkCollisions();
 
     /** Process chunk generation queue */
     void ProcessGenerationQueue();
@@ -176,8 +221,15 @@ protected:
     /** Update neighbor references for a chunk */
     void UpdateChunkNeighbors(AVoxelChunk* Chunk);
 
-    /** Get distance from load center (in chunks) */
+    // ==========================================
+    // Distance Calculations
+    // ==========================================
+
+    /** Get distance from load center (in chunks) - horizontal only */
     float GetChunkDistanceFromCenter(const FChunkCoord& ChunkCoord) const;
+
+    /** Get LOD level for a chunk based on distance */
+    EVoxelLOD GetLODForDistance(float Distance) const;
 
     /** Sort chunks by distance from load center */
     void SortQueueByDistance(TArray<FChunkCoord>& Queue);
@@ -185,11 +237,18 @@ protected:
     /** Get effective render distance (editor vs runtime) */
     int32 GetEffectiveRenderDistance() const;
 
-#if WITH_EDITOR
-    /** Initialize for editor preview */
-    void InitializeEditorPreview();
+    // ==========================================
+    // Async Task Management
+    // ==========================================
 
-    /** Check if we're in editor (not playing) */
+    /** Wait for all async tasks to complete (called during shutdown) */
+    void WaitForAsyncTasks();
+
+    /** Counter for active async tasks */
+    TAtomic<int32> ActiveAsyncTasks{0};
+
+#if WITH_EDITOR
+    void InitializeEditorPreview();
     bool IsInEditorPreviewMode() const;
 #endif
 };

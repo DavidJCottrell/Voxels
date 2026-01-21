@@ -11,19 +11,49 @@
 #include "Editor.h"
 #endif
 
+// ==========================================
+// Async Task Implementation
+// ==========================================
+
 void FChunkGenerationTask::DoWork()
 {
-    if (Chunk && IsValid(Chunk))
+    // Check cancellation flag before doing any work
+    if (CancelFlag && *CancelFlag)
     {
-        Chunk->GenerateVoxelData();
+        return;
     }
+
+    // Check if chunk is still valid
+    if (!Chunk || !IsValid(Chunk) || Chunk->IsPendingKillOrUnreachable())
+    {
+        return;
+    }
+
+    // Generate the voxel data
+    Chunk->GenerateVoxelData();
 }
+
+// ==========================================
+// Constructor / Destructor
+// ==========================================
 
 AVoxelWorldManager::AVoxelWorldManager()
 {
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.TickInterval = 0.0f; // Tick every frame
+
+    bCancelAsyncTasks = false;
 }
+
+AVoxelWorldManager::~AVoxelWorldManager()
+{
+    // Ensure async tasks are cancelled
+    bCancelAsyncTasks = true;
+}
+
+// ==========================================
+// Lifecycle
+// ==========================================
 
 void AVoxelWorldManager::BeginPlay()
 {
@@ -37,6 +67,9 @@ void AVoxelWorldManager::BeginPlay()
         bIsInitialized = false;
     }
 
+    // Reset cancellation flag
+    bCancelAsyncTasks = false;
+
     // Auto-initialize if not done manually
     if (!bIsInitialized)
     {
@@ -46,10 +79,39 @@ void AVoxelWorldManager::BeginPlay()
 
 void AVoxelWorldManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    UE_LOG(LogVoxelWorld, Log, TEXT("VoxelWorldManager EndPlay - cleaning up..."));
+
+    // Signal all async tasks to cancel
+    bCancelAsyncTasks = true;
+
+    // Wait for async tasks to complete
+    WaitForAsyncTasks();
+
     // Clean up all chunks
     DestroyAllChunks();
 
     Super::EndPlay(EndPlayReason);
+
+    UE_LOG(LogVoxelWorld, Log, TEXT("VoxelWorldManager cleanup complete"));
+}
+
+void AVoxelWorldManager::WaitForAsyncTasks()
+{
+    // Wait for all async tasks to finish (with timeout)
+    const float TimeoutSeconds = 5.0f;
+    const float StartTime = FPlatformTime::Seconds();
+
+    while (ActiveAsyncTasks.Load() > 0)
+    {
+        if (FPlatformTime::Seconds() - StartTime > TimeoutSeconds)
+        {
+            UE_LOG(LogVoxelWorld, Warning, TEXT("Timeout waiting for async tasks to complete. %d tasks still running."), ActiveAsyncTasks.Load());
+            break;
+        }
+
+        // Give some time for tasks to complete
+        FPlatformProcess::Sleep(0.01f);
+    }
 }
 
 void AVoxelWorldManager::OnConstruction(const FTransform& Transform)
@@ -57,10 +119,8 @@ void AVoxelWorldManager::OnConstruction(const FTransform& Transform)
     Super::OnConstruction(Transform);
 
 #if WITH_EDITOR
-    // Only generate preview if enabled and we're in the editor (not playing)
     if (bEnableEditorPreview && IsInEditorPreviewMode())
     {
-        // Delay initialization to avoid issues during construction
         if (!bIsInitialized)
         {
             InitializeEditorPreview();
@@ -68,7 +128,6 @@ void AVoxelWorldManager::OnConstruction(const FTransform& Transform)
     }
     else if (!bEnableEditorPreview && bIsEditorPreview)
     {
-        // Clear preview if it was disabled
         ClearEditorPreview();
     }
 #endif
@@ -76,7 +135,6 @@ void AVoxelWorldManager::OnConstruction(const FTransform& Transform)
 
 bool AVoxelWorldManager::ShouldTickIfViewportsOnly() const
 {
-    // Allow ticking in editor when preview is enabled
     return bEnableEditorPreview && bIsEditorPreview;
 }
 
@@ -89,7 +147,6 @@ void AVoxelWorldManager::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
         ? PropertyChangedEvent.Property->GetFName()
         : NAME_None;
 
-    // Check if editor preview was toggled
     if (PropertyName == GET_MEMBER_NAME_CHECKED(AVoxelWorldManager, bEnableEditorPreview))
     {
         if (bEnableEditorPreview)
@@ -103,7 +160,6 @@ void AVoxelWorldManager::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
         return;
     }
 
-    // Check if preview distance changed
     if (PropertyName == GET_MEMBER_NAME_CHECKED(AVoxelWorldManager, EditorPreviewDistance))
     {
         if (bEnableEditorPreview && bAutoRegeneratePreview)
@@ -113,7 +169,6 @@ void AVoxelWorldManager::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
         return;
     }
 
-    // Check if any world settings changed
     if (PropertyChangedEvent.MemberProperty != nullptr)
     {
         FName MemberName = PropertyChangedEvent.MemberProperty->GetFName();
@@ -129,41 +184,26 @@ void AVoxelWorldManager::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
 
 bool AVoxelWorldManager::IsInEditorPreviewMode() const
 {
-    // Check if we're in editor and not playing
     UWorld* World = GetWorld();
-    if (!World)
-    {
-        return false;
-    }
+    if (!World) return false;
 
-    // Check for editor world
-    if (World->WorldType == EWorldType::Editor || World->WorldType == EWorldType::EditorPreview)
-    {
-        return true;
-    }
-
-    return false;
+    return World->WorldType == EWorldType::Editor || World->WorldType == EWorldType::EditorPreview;
 }
 
 void AVoxelWorldManager::InitializeEditorPreview()
 {
-    if (bIsInitialized)
-    {
-        return;
-    }
+    if (bIsInitialized) return;
 
     UE_LOG(LogVoxelWorld, Log, TEXT("Initializing editor preview..."));
 
-    // Create terrain generator
     TerrainGenerator = NewObject<UVoxelTerrainGenerator>(this);
     TerrainGenerator->Initialize(WorldSettings);
 
-    // Use actor's position as the center for preview
     CurrentLoadCenter = WorldToChunkCoord(GetActorLocation());
     bIsInitialized = true;
     bIsEditorPreview = true;
+    bCancelAsyncTasks = false;
 
-    // Start loading chunks around the actor
     UpdateChunkLoading();
 }
 #endif
@@ -179,14 +219,16 @@ void AVoxelWorldManager::RegenerateEditorPreview()
 
     UE_LOG(LogVoxelWorld, Log, TEXT("Regenerating editor preview..."));
 
-    // Clear existing chunks
+    bCancelAsyncTasks = true;
+    WaitForAsyncTasks();
+
     DestroyAllChunks();
     bIsInitialized = false;
     bIsEditorPreview = false;
 
-    // Reinitialize
     if (bEnableEditorPreview)
     {
+        bCancelAsyncTasks = false;
         InitializeEditorPreview();
     }
 #endif
@@ -197,11 +239,18 @@ void AVoxelWorldManager::ClearEditorPreview()
 #if WITH_EDITOR
     UE_LOG(LogVoxelWorld, Log, TEXT("Clearing editor preview..."));
 
+    bCancelAsyncTasks = true;
+    WaitForAsyncTasks();
+
     DestroyAllChunks();
     bIsInitialized = false;
     bIsEditorPreview = false;
 #endif
 }
+
+// ==========================================
+// Initialization
+// ==========================================
 
 int32 AVoxelWorldManager::GetEffectiveRenderDistance() const
 {
@@ -222,31 +271,63 @@ void AVoxelWorldManager::InitializeWorld()
         return;
     }
 
-    // Create terrain generator
     TerrainGenerator = NewObject<UVoxelTerrainGenerator>(this);
     TerrainGenerator->Initialize(WorldSettings);
 
     CurrentLoadCenter = FChunkCoord(0, 0, 0);
     bIsInitialized = true;
     bIsEditorPreview = false;
+    bCancelAsyncTasks = false;
 
-    UE_LOG(LogVoxelWorld, Log, TEXT("Voxel World initialized with seed %d, chunk size %d, render distance %d"),
-        WorldSettings.Seed, WorldSettings.ChunkSize, WorldSettings.RenderDistance);
+    UE_LOG(LogVoxelWorld, Log, TEXT("Voxel World initialized - Seed: %d, ChunkSize: %d, RenderDist: %d, LOD0: %d, LOD1: %d, LOD2: %d, CollisionDist: %d"),
+        WorldSettings.Seed,
+        WorldSettings.ChunkSize,
+        WorldSettings.RenderDistance,
+        WorldSettings.LODSettings.LOD0Distance,
+        WorldSettings.LODSettings.LOD1Distance,
+        WorldSettings.LODSettings.LOD2Distance,
+        WorldSettings.LODSettings.CollisionDistance);
 
-    // Start loading chunks around origin
     UpdateChunkLoading();
 }
+
+// ==========================================
+// Tick
+// ==========================================
 
 void AVoxelWorldManager::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    if (!bIsInitialized) return;
+    if (!bIsInitialized || bCancelAsyncTasks)
+    {
+        return;
+    }
 
     // Process queues
     ProcessGenerationQueue();
     ProcessMeshBuildQueue();
+
+    // Periodic LOD updates (not every frame)
+    LODUpdateTimer += DeltaTime;
+    if (LODUpdateTimer >= LODUpdateInterval)
+    {
+        LODUpdateTimer = 0.0f;
+        UpdateChunkLODs();
+    }
+
+    // Periodic collision updates
+    CollisionUpdateTimer += DeltaTime;
+    if (CollisionUpdateTimer >= CollisionUpdateInterval)
+    {
+        CollisionUpdateTimer = 0.0f;
+        UpdateChunkCollisions();
+    }
 }
+
+// ==========================================
+// Load Center and Chunk Loading
+// ==========================================
 
 void AVoxelWorldManager::SetLoadCenter(const FVector& WorldPosition)
 {
@@ -276,124 +357,34 @@ void AVoxelWorldManager::WorldToLocalVoxelCoord(const FVector& WorldPosition, FC
 
     float ChunkWorldSize = WorldSettings.ChunkSize * WorldSettings.VoxelSize;
 
-    // Get position relative to chunk origin
     FVector RelativePos = WorldPosition - FVector(
         OutChunkCoord.X * ChunkWorldSize,
         OutChunkCoord.Y * ChunkWorldSize,
         OutChunkCoord.Z * ChunkWorldSize
     );
 
-    // Convert to voxel coordinates
     OutLocalX = FMath::FloorToInt(RelativePos.X / WorldSettings.VoxelSize);
     OutLocalY = FMath::FloorToInt(RelativePos.Y / WorldSettings.VoxelSize);
     OutLocalZ = FMath::FloorToInt(RelativePos.Z / WorldSettings.VoxelSize);
 
-    // Clamp to valid range
     OutLocalX = FMath::Clamp(OutLocalX, 0, WorldSettings.ChunkSize - 1);
     OutLocalY = FMath::Clamp(OutLocalY, 0, WorldSettings.ChunkSize - 1);
     OutLocalZ = FMath::Clamp(OutLocalZ, 0, WorldSettings.ChunkSize - 1);
 }
 
-AVoxelChunk* AVoxelWorldManager::GetChunk(const FChunkCoord& ChunkCoord) const
-{
-    const TObjectPtr<AVoxelChunk>* ChunkPtr = LoadedChunks.Find(ChunkCoord);
-    return ChunkPtr ? *ChunkPtr : nullptr;
-}
-
-FVoxel AVoxelWorldManager::GetVoxelAtWorldPosition(const FVector& WorldPosition) const
-{
-    FChunkCoord ChunkCoord;
-    int32 LocalX, LocalY, LocalZ;
-    WorldToLocalVoxelCoord(WorldPosition, ChunkCoord, LocalX, LocalY, LocalZ);
-
-    AVoxelChunk* Chunk = GetChunk(ChunkCoord);
-    if (Chunk && Chunk->IsGenerated())
-    {
-        return Chunk->GetVoxel(LocalX, LocalY, LocalZ);
-    }
-
-    return FVoxel(EVoxelType::Air);
-}
-
-void AVoxelWorldManager::SetVoxelAtWorldPosition(const FVector& WorldPosition, const FVoxel& Voxel)
-{
-    FChunkCoord ChunkCoord;
-    int32 LocalX, LocalY, LocalZ;
-    WorldToLocalVoxelCoord(WorldPosition, ChunkCoord, LocalX, LocalY, LocalZ);
-
-    AVoxelChunk* Chunk = GetChunk(ChunkCoord);
-    if (Chunk && Chunk->IsGenerated())
-    {
-        Chunk->SetVoxel(LocalX, LocalY, LocalZ, Voxel);
-
-        // Add to mesh rebuild queue if not already there
-        if (!MeshBuildQueue.Contains(Chunk))
-        {
-            MeshBuildQueue.Add(Chunk);
-        }
-
-        // Also update adjacent chunks if voxel is on boundary
-        if (LocalX == 0)
-        {
-            AVoxelChunk* Neighbor = GetChunk(FChunkCoord(ChunkCoord.X - 1, ChunkCoord.Y, ChunkCoord.Z));
-            if (Neighbor && !MeshBuildQueue.Contains(Neighbor))
-                MeshBuildQueue.Add(Neighbor);
-        }
-        else if (LocalX == WorldSettings.ChunkSize - 1)
-        {
-            AVoxelChunk* Neighbor = GetChunk(FChunkCoord(ChunkCoord.X + 1, ChunkCoord.Y, ChunkCoord.Z));
-            if (Neighbor && !MeshBuildQueue.Contains(Neighbor))
-                MeshBuildQueue.Add(Neighbor);
-        }
-
-        if (LocalY == 0)
-        {
-            AVoxelChunk* Neighbor = GetChunk(FChunkCoord(ChunkCoord.X, ChunkCoord.Y - 1, ChunkCoord.Z));
-            if (Neighbor && !MeshBuildQueue.Contains(Neighbor))
-                MeshBuildQueue.Add(Neighbor);
-        }
-        else if (LocalY == WorldSettings.ChunkSize - 1)
-        {
-            AVoxelChunk* Neighbor = GetChunk(FChunkCoord(ChunkCoord.X, ChunkCoord.Y + 1, ChunkCoord.Z));
-            if (Neighbor && !MeshBuildQueue.Contains(Neighbor))
-                MeshBuildQueue.Add(Neighbor);
-        }
-
-        if (LocalZ == 0)
-        {
-            AVoxelChunk* Neighbor = GetChunk(FChunkCoord(ChunkCoord.X, ChunkCoord.Y, ChunkCoord.Z - 1));
-            if (Neighbor && !MeshBuildQueue.Contains(Neighbor))
-                MeshBuildQueue.Add(Neighbor);
-        }
-        else if (LocalZ == WorldSettings.ChunkSize - 1)
-        {
-            AVoxelChunk* Neighbor = GetChunk(FChunkCoord(ChunkCoord.X, ChunkCoord.Y, ChunkCoord.Z + 1));
-            if (Neighbor && !MeshBuildQueue.Contains(Neighbor))
-                MeshBuildQueue.Add(Neighbor);
-        }
-    }
-}
-
-float AVoxelWorldManager::GetTerrainHeightAtWorldPosition(float WorldX, float WorldY) const
-{
-    if (!TerrainGenerator) return 0.0f;
-
-    // Convert to voxel coordinates
-    int32 VoxelX = FMath::FloorToInt(WorldX / WorldSettings.VoxelSize);
-    int32 VoxelY = FMath::FloorToInt(WorldY / WorldSettings.VoxelSize);
-
-    float TerrainHeight = TerrainGenerator->GetTerrainHeight(VoxelX, VoxelY);
-    return TerrainHeight * WorldSettings.VoxelSize;
-}
-
 void AVoxelWorldManager::UpdateChunkLoading()
 {
+    if (bCancelAsyncTasks)
+    {
+        return;
+    }
+
     int32 RenderDist = GetEffectiveRenderDistance();
     int32 HeightChunks = WorldSettings.WorldHeightChunks;
 
-    // Determine which chunks should be loaded
     TSet<FChunkCoord> ChunksToKeep;
 
+    // Determine which chunks should be loaded
     for (int32 X = CurrentLoadCenter.X - RenderDist; X <= CurrentLoadCenter.X + RenderDist; ++X)
     {
         for (int32 Y = CurrentLoadCenter.Y - RenderDist; Y <= CurrentLoadCenter.Y + RenderDist; ++Y)
@@ -417,10 +408,10 @@ void AVoxelWorldManager::UpdateChunkLoading()
         }
     }
 
-    // Sort generation queue by distance
+    // Sort generation queue by distance (load closest first)
     SortQueueByDistance(ChunkGenerationQueue);
 
-    // Unload chunks that are too far away
+    // Unload/recycle chunks that are too far away
     TArray<FChunkCoord> ChunksToUnload;
     for (auto& Pair : LoadedChunks)
     {
@@ -432,12 +423,86 @@ void AVoxelWorldManager::UpdateChunkLoading()
 
     for (const FChunkCoord& Coord : ChunksToUnload)
     {
-        DestroyChunk(Coord);
+        RecycleChunk(Coord);
     }
 }
 
-AVoxelChunk* AVoxelWorldManager::CreateChunk(const FChunkCoord& ChunkCoord)
+// ==========================================
+// LOD Management
+// ==========================================
+
+void AVoxelWorldManager::UpdateChunkLODs()
 {
+    for (auto& Pair : LoadedChunks)
+    {
+        if (!Pair.Value || !IsValid(Pair.Value))
+        {
+            continue;
+        }
+
+        float Distance = GetChunkDistanceFromCenter(Pair.Key);
+        EVoxelLOD NewLOD = GetLODForDistance(Distance);
+
+        if (Pair.Value->GetCurrentLOD() != NewLOD)
+        {
+            Pair.Value->SetLOD(NewLOD);
+
+            // Add to mesh rebuild queue
+            if (!MeshBuildQueue.Contains(Pair.Value))
+            {
+                MeshBuildQueue.Add(Pair.Value);
+            }
+        }
+    }
+}
+
+EVoxelLOD AVoxelWorldManager::GetLODForDistance(float Distance) const
+{
+    return WorldSettings.LODSettings.GetLODForDistance(Distance);
+}
+
+// ==========================================
+// Collision Management
+// ==========================================
+
+void AVoxelWorldManager::UpdateChunkCollisions()
+{
+    for (auto& Pair : LoadedChunks)
+    {
+        if (!Pair.Value || !IsValid(Pair.Value))
+        {
+            continue;
+        }
+
+        float Distance = GetChunkDistanceFromCenter(Pair.Key);
+        bool bShouldHaveCollision = WorldSettings.LODSettings.ShouldHaveCollision(Distance);
+
+        if (Pair.Value->IsCollisionEnabled() != bShouldHaveCollision)
+        {
+            Pair.Value->SetCollisionEnabled(bShouldHaveCollision);
+
+            // Need to rebuild mesh with or without collision
+            if (Pair.Value->IsGenerated() && !MeshBuildQueue.Contains(Pair.Value))
+            {
+                MeshBuildQueue.Add(Pair.Value);
+            }
+        }
+    }
+}
+
+// ==========================================
+// Chunk Creation / Destruction / Pooling
+// ==========================================
+
+AVoxelChunk* AVoxelWorldManager::GetChunk(const FChunkCoord& ChunkCoord) const
+{
+    const TObjectPtr<AVoxelChunk>* ChunkPtr = LoadedChunks.Find(ChunkCoord);
+    return ChunkPtr ? *ChunkPtr : nullptr;
+}
+
+AVoxelChunk* AVoxelWorldManager::CreateOrGetChunk(const FChunkCoord& ChunkCoord)
+{
+    // Check if already loaded
     if (LoadedChunks.Contains(ChunkCoord))
     {
         return LoadedChunks[ChunkCoord];
@@ -449,47 +514,105 @@ AVoxelChunk* AVoxelWorldManager::CreateChunk(const FChunkCoord& ChunkCoord)
         return nullptr;
     }
 
-    FActorSpawnParameters SpawnParams;
-    SpawnParams.Owner = this;
+    AVoxelChunk* Chunk = nullptr;
 
-#if WITH_EDITOR
-    // In editor, spawn chunks that won't be saved with the level
-    if (bIsEditorPreview)
+    // Try to get from pool first
+    if (WorldSettings.bEnableChunkPooling && ChunkPool.Num() > 0)
     {
-        SpawnParams.ObjectFlags |= RF_Transient;
+        Chunk = ChunkPool.Pop();
+        if (Chunk && IsValid(Chunk))
+        {
+            Chunk->ResetChunk();
+            UE_LOG(LogVoxelWorld, Verbose, TEXT("Reusing pooled chunk for %s"), *ChunkCoord.ToString());
+        }
+        else
+        {
+            Chunk = nullptr;
+        }
     }
-#endif
 
-    AVoxelChunk* NewChunk = World->SpawnActor<AVoxelChunk>(AVoxelChunk::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
-
-    if (NewChunk)
+    // Create new chunk if pool was empty
+    if (!Chunk)
     {
+        FActorSpawnParameters SpawnParams;
+        SpawnParams.Owner = this;
+
 #if WITH_EDITOR
-        // Mark as hidden from outliner in editor preview
         if (bIsEditorPreview)
         {
-            NewChunk->SetFlags(RF_Transient);
-            NewChunk->SetActorLabel(FString::Printf(TEXT("PreviewChunk_%s"), *ChunkCoord.ToString()));
+            SpawnParams.ObjectFlags |= RF_Transient;
         }
 #endif
 
-        NewChunk->InitializeChunk(ChunkCoord, WorldSettings, TerrainGenerator);
+        Chunk = World->SpawnActor<AVoxelChunk>(AVoxelChunk::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
 
-        // Apply material if set
-        if (VoxelMaterial)
+        if (!Chunk)
         {
-            UProceduralMeshComponent* MeshComp = NewChunk->FindComponentByClass<UProceduralMeshComponent>();
-            if (MeshComp)
-            {
-                MeshComp->SetMaterial(0, VoxelMaterial);
-            }
+            UE_LOG(LogVoxelWorld, Error, TEXT("Failed to spawn chunk for %s"), *ChunkCoord.ToString());
+            return nullptr;
         }
 
-        LoadedChunks.Add(ChunkCoord, NewChunk);
-        UpdateChunkNeighbors(NewChunk);
+#if WITH_EDITOR
+        if (bIsEditorPreview)
+        {
+            Chunk->SetFlags(RF_Transient);
+            Chunk->SetActorLabel(FString::Printf(TEXT("PreviewChunk_%s"), *ChunkCoord.ToString()));
+        }
+#endif
     }
 
-    return NewChunk;
+    // Initialize chunk
+    Chunk->InitializeChunk(ChunkCoord, WorldSettings, TerrainGenerator);
+
+    // Set initial LOD and collision based on distance
+    float Distance = GetChunkDistanceFromCenter(ChunkCoord);
+    Chunk->SetLOD(GetLODForDistance(Distance));
+    Chunk->SetCollisionEnabled(WorldSettings.LODSettings.ShouldHaveCollision(Distance));
+
+    // Apply material if set
+    if (VoxelMaterial)
+    {
+        UProceduralMeshComponent* MeshComp = Chunk->FindComponentByClass<UProceduralMeshComponent>();
+        if (MeshComp)
+        {
+            MeshComp->SetMaterial(0, VoxelMaterial);
+        }
+    }
+
+    LoadedChunks.Add(ChunkCoord, Chunk);
+    UpdateChunkNeighbors(Chunk);
+
+    return Chunk;
+}
+
+void AVoxelWorldManager::RecycleChunk(const FChunkCoord& ChunkCoord)
+{
+    TObjectPtr<AVoxelChunk>* ChunkPtr = LoadedChunks.Find(ChunkCoord);
+    if (!ChunkPtr || !*ChunkPtr)
+    {
+        LoadedChunks.Remove(ChunkCoord);
+        return;
+    }
+
+    AVoxelChunk* Chunk = *ChunkPtr;
+
+    // Remove from mesh build queue
+    MeshBuildQueue.Remove(Chunk);
+
+    // Try to add to pool
+    if (WorldSettings.bEnableChunkPooling && ChunkPool.Num() < WorldSettings.ChunkPoolSize)
+    {
+        Chunk->ResetChunk();
+        ChunkPool.Add(Chunk);
+        UE_LOG(LogVoxelWorld, Verbose, TEXT("Recycled chunk %s to pool (pool size: %d)"), *ChunkCoord.ToString(), ChunkPool.Num());
+    }
+    else
+    {
+        // Pool full - destroy chunk
+        Chunk->Destroy();
+    }
+
+    LoadedChunks.Remove(ChunkCoord);
 }
 
 void AVoxelWorldManager::DestroyChunk(const FChunkCoord& ChunkCoord)
@@ -497,16 +620,30 @@ void AVoxelWorldManager::DestroyChunk(const FChunkCoord& ChunkCoord)
     TObjectPtr<AVoxelChunk>* ChunkPtr = LoadedChunks.Find(ChunkCoord);
     if (ChunkPtr && *ChunkPtr)
     {
-        // Remove from mesh build queue
         MeshBuildQueue.Remove(*ChunkPtr);
-
         (*ChunkPtr)->Destroy();
-        LoadedChunks.Remove(ChunkCoord);
     }
+    LoadedChunks.Remove(ChunkCoord);
 }
 
 void AVoxelWorldManager::DestroyAllChunks()
 {
+    UE_LOG(LogVoxelWorld, Log, TEXT("Destroying all chunks..."));
+
+    // Mark all chunks for cancellation first
+    for (auto& Pair : LoadedChunks)
+    {
+        if (Pair.Value && IsValid(Pair.Value))
+        {
+            Pair.Value->MarkPendingKill();
+        }
+    }
+
+    // Clear queues
+    ChunkGenerationQueue.Empty();
+    MeshBuildQueue.Empty();
+
+    // Destroy loaded chunks
     for (auto& Pair : LoadedChunks)
     {
         if (Pair.Value && IsValid(Pair.Value))
@@ -515,16 +652,34 @@ void AVoxelWorldManager::DestroyAllChunks()
         }
     }
     LoadedChunks.Empty();
-    ChunkGenerationQueue.Empty();
-    MeshBuildQueue.Empty();
+
+    // Destroy pooled chunks
+    for (auto& Chunk : ChunkPool)
+    {
+        if (Chunk && IsValid(Chunk))
+        {
+            Chunk->Destroy();
+        }
+    }
+    ChunkPool.Empty();
+
+    UE_LOG(LogVoxelWorld, Log, TEXT("All chunks destroyed"));
 }
+
+// ==========================================
+// Queue Processing
+// ==========================================
 
 void AVoxelWorldManager::ProcessGenerationQueue()
 {
-    int32 ChunksProcessed = 0;
+    if (bCancelAsyncTasks)
+    {
+        return;
+    }
 
-    // In editor preview, process more chunks per frame for faster preview
+    int32 ChunksProcessed = 0;
     int32 MaxChunksPerFrame = WorldSettings.ChunksPerFrame;
+
 #if WITH_EDITOR
     if (bIsEditorPreview)
     {
@@ -534,16 +689,20 @@ void AVoxelWorldManager::ProcessGenerationQueue()
 
     while (ChunkGenerationQueue.Num() > 0 && ChunksProcessed < MaxChunksPerFrame)
     {
+        if (bCancelAsyncTasks)
+        {
+            break;
+        }
+
         FChunkCoord Coord = ChunkGenerationQueue[0];
         ChunkGenerationQueue.RemoveAt(0);
 
-        // Create chunk if not exists
-        AVoxelChunk* Chunk = CreateChunk(Coord);
+        AVoxelChunk* Chunk = CreateOrGetChunk(Coord);
 
         if (Chunk && !Chunk->IsGenerated())
         {
-            // In editor preview, always use synchronous generation for reliability
 #if WITH_EDITOR
+            // Always use synchronous generation in editor preview
             if (bIsEditorPreview)
             {
                 Chunk->GenerateVoxelData();
@@ -552,8 +711,18 @@ void AVoxelWorldManager::ProcessGenerationQueue()
 #endif
             if (WorldSettings.bAsyncGeneration)
             {
-                // Async generation
-                (new FAutoDeleteAsyncTask<FChunkGenerationTask>(Chunk))->StartBackgroundTask();
+                // Track active async task
+                ++ActiveAsyncTasks;
+
+                // Start async task
+                auto* Task = new FAutoDeleteAsyncTask<FChunkGenerationTask>(Chunk, &bCancelAsyncTasks);
+                Task->StartBackgroundTask();
+
+                // Decrement counter when done (on game thread)
+                AsyncTask(ENamedThreads::GameThread, [this]()
+                {
+                    --ActiveAsyncTasks;
+                });
             }
             else
             {
@@ -562,7 +731,10 @@ void AVoxelWorldManager::ProcessGenerationQueue()
             }
 
             // Add to mesh build queue
-            MeshBuildQueue.Add(Chunk);
+            if (!MeshBuildQueue.Contains(Chunk))
+            {
+                MeshBuildQueue.Add(Chunk);
+            }
             ChunksProcessed++;
         }
     }
@@ -570,11 +742,16 @@ void AVoxelWorldManager::ProcessGenerationQueue()
 
 void AVoxelWorldManager::ProcessMeshBuildQueue()
 {
+    if (bCancelAsyncTasks)
+    {
+        return;
+    }
+
     int32 MeshesBuilt = 0;
     TArray<AVoxelChunk*> ChunksToRequeue;
 
-    // In editor preview, process more meshes per frame
-    int32 MaxMeshesPerFrame = WorldSettings.ChunksPerFrame;
+    int32 MaxMeshesPerFrame = WorldSettings.MeshBuildsPerFrame;
+
 #if WITH_EDITOR
     if (bIsEditorPreview)
     {
@@ -584,10 +761,15 @@ void AVoxelWorldManager::ProcessMeshBuildQueue()
 
     while (MeshBuildQueue.Num() > 0 && MeshesBuilt < MaxMeshesPerFrame)
     {
+        if (bCancelAsyncTasks)
+        {
+            break;
+        }
+
         AVoxelChunk* Chunk = MeshBuildQueue[0];
         MeshBuildQueue.RemoveAt(0);
 
-        if (!Chunk || !IsValid(Chunk))
+        if (!Chunk || !IsValid(Chunk) || Chunk->IsPendingKillOrUnreachable())
         {
             continue;
         }
@@ -601,7 +783,7 @@ void AVoxelWorldManager::ProcessMeshBuildQueue()
 
         if (Chunk->NeedsMeshRebuild())
         {
-            // Update neighbors before building mesh for seamless connections
+            // Update neighbors before building mesh
             UpdateChunkNeighbors(Chunk);
             Chunk->BuildMesh();
             MeshesBuilt++;
@@ -611,7 +793,10 @@ void AVoxelWorldManager::ProcessMeshBuildQueue()
     // Re-add chunks that weren't ready yet
     for (AVoxelChunk* Chunk : ChunksToRequeue)
     {
-        MeshBuildQueue.Add(Chunk);
+        if (Chunk && IsValid(Chunk) && !MeshBuildQueue.Contains(Chunk))
+        {
+            MeshBuildQueue.Add(Chunk);
+        }
     }
 }
 
@@ -631,11 +816,15 @@ void AVoxelWorldManager::UpdateChunkNeighbors(AVoxelChunk* Chunk)
     Chunk->SetNeighbors(XPos, XNeg, YPos, YNeg, ZPos, ZNeg);
 }
 
+// ==========================================
+// Distance Calculations
+// ==========================================
+
 float AVoxelWorldManager::GetChunkDistanceFromCenter(const FChunkCoord& ChunkCoord) const
 {
-    // Use horizontal distance only for loading (ignore Z)
-    float DX = ChunkCoord.X - CurrentLoadCenter.X;
-    float DY = ChunkCoord.Y - CurrentLoadCenter.Y;
+    // Use horizontal distance only (ignore Z for LOD/loading)
+    float DX = static_cast<float>(ChunkCoord.X - CurrentLoadCenter.X);
+    float DY = static_cast<float>(ChunkCoord.Y - CurrentLoadCenter.Y);
     return FMath::Sqrt(DX * DX + DY * DY);
 }
 
@@ -647,9 +836,84 @@ void AVoxelWorldManager::SortQueueByDistance(TArray<FChunkCoord>& Queue)
     });
 }
 
+// ==========================================
+// Voxel Access
+// ==========================================
+
+FVoxel AVoxelWorldManager::GetVoxelAtWorldPosition(const FVector& WorldPosition) const
+{
+    FChunkCoord ChunkCoord;
+    int32 LocalX, LocalY, LocalZ;
+    WorldToLocalVoxelCoord(WorldPosition, ChunkCoord, LocalX, LocalY, LocalZ);
+
+    AVoxelChunk* Chunk = GetChunk(ChunkCoord);
+    if (Chunk && Chunk->IsGenerated() && Chunk->HasVoxelData())
+    {
+        return Chunk->GetVoxel(LocalX, LocalY, LocalZ);
+    }
+
+    return FVoxel(EVoxelType::Air);
+}
+
+void AVoxelWorldManager::SetVoxelAtWorldPosition(const FVector& WorldPosition, const FVoxel& Voxel)
+{
+    FChunkCoord ChunkCoord;
+    int32 LocalX, LocalY, LocalZ;
+    WorldToLocalVoxelCoord(WorldPosition, ChunkCoord, LocalX, LocalY, LocalZ);
+
+    AVoxelChunk* Chunk = GetChunk(ChunkCoord);
+    if (Chunk && Chunk->IsGenerated() && Chunk->HasVoxelData())
+    {
+        Chunk->SetVoxel(LocalX, LocalY, LocalZ, Voxel);
+
+        if (!MeshBuildQueue.Contains(Chunk))
+        {
+            MeshBuildQueue.Add(Chunk);
+        }
+
+        // Update adjacent chunks if on boundary
+        auto QueueNeighborIfNeeded = [this](AVoxelChunk* Neighbor)
+        {
+            if (Neighbor && !MeshBuildQueue.Contains(Neighbor))
+            {
+                MeshBuildQueue.Add(Neighbor);
+            }
+        };
+
+        if (LocalX == 0)
+            QueueNeighborIfNeeded(GetChunk(FChunkCoord(ChunkCoord.X - 1, ChunkCoord.Y, ChunkCoord.Z)));
+        else if (LocalX == WorldSettings.ChunkSize - 1)
+            QueueNeighborIfNeeded(GetChunk(FChunkCoord(ChunkCoord.X + 1, ChunkCoord.Y, ChunkCoord.Z)));
+
+        if (LocalY == 0)
+            QueueNeighborIfNeeded(GetChunk(FChunkCoord(ChunkCoord.X, ChunkCoord.Y - 1, ChunkCoord.Z)));
+        else if (LocalY == WorldSettings.ChunkSize - 1)
+            QueueNeighborIfNeeded(GetChunk(FChunkCoord(ChunkCoord.X, ChunkCoord.Y + 1, ChunkCoord.Z)));
+
+        if (LocalZ == 0)
+            QueueNeighborIfNeeded(GetChunk(FChunkCoord(ChunkCoord.X, ChunkCoord.Y, ChunkCoord.Z - 1)));
+        else if (LocalZ == WorldSettings.ChunkSize - 1)
+            QueueNeighborIfNeeded(GetChunk(FChunkCoord(ChunkCoord.X, ChunkCoord.Y, ChunkCoord.Z + 1)));
+    }
+}
+
+float AVoxelWorldManager::GetTerrainHeightAtWorldPosition(float WorldX, float WorldY) const
+{
+    if (!TerrainGenerator) return 0.0f;
+
+    int32 VoxelX = FMath::FloorToInt(WorldX / WorldSettings.VoxelSize);
+    int32 VoxelY = FMath::FloorToInt(WorldY / WorldSettings.VoxelSize);
+
+    float TerrainHeight = TerrainGenerator->GetTerrainHeight(VoxelX, VoxelY);
+    return TerrainHeight * WorldSettings.VoxelSize;
+}
+
+// ==========================================
+// Raycasting
+// ==========================================
+
 bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, FVector& OutHitPosition, FVector& OutHitNormal, FVoxel& OutHitVoxel) const
 {
-    // DDA raycast through voxels
     FVector Direction = (End - Start).GetSafeNormal();
     float MaxDistance = (End - Start).Size();
     float VoxelSize = WorldSettings.VoxelSize;
@@ -660,9 +924,6 @@ bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, 
     Step.Y = Direction.Y >= 0 ? VoxelSize : -VoxelSize;
     Step.Z = Direction.Z >= 0 ? VoxelSize : -VoxelSize;
 
-    // Calculate initial t values
-    FVector TMax, TDelta;
-
     auto GetTMax = [&](float Pos, float Dir, float StepDir) -> float
     {
         if (FMath::Abs(Dir) < SMALL_NUMBER) return MAX_FLT;
@@ -671,6 +932,7 @@ bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, 
         return (Boundary - Pos) / Dir;
     };
 
+    FVector TMax, TDelta;
     TMax.X = GetTMax(Start.X, Direction.X, Step.X);
     TMax.Y = GetTMax(Start.Y, Direction.Y, Step.Y);
     TMax.Z = GetTMax(Start.Z, Direction.Z, Step.Z);
@@ -682,7 +944,7 @@ bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, 
     float T = 0.0f;
     int32 MaxSteps = FMath::CeilToInt(MaxDistance / VoxelSize) * 3;
 
-    for (int32 Step_ = 0; Step_ < MaxSteps && T < MaxDistance; ++Step_)
+    for (int32 StepCount = 0; StepCount < MaxSteps && T < MaxDistance; ++StepCount)
     {
         FVoxel Voxel = GetVoxelAtWorldPosition(CurrentPos);
 
@@ -691,24 +953,16 @@ bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, 
             OutHitPosition = CurrentPos;
             OutHitVoxel = Voxel;
 
-            // Determine hit normal based on which face was hit
             if (TMax.X < TMax.Y && TMax.X < TMax.Z)
-            {
                 OutHitNormal = FVector(Step.X > 0 ? -1 : 1, 0, 0);
-            }
             else if (TMax.Y < TMax.Z)
-            {
                 OutHitNormal = FVector(0, Step.Y > 0 ? -1 : 1, 0);
-            }
             else
-            {
                 OutHitNormal = FVector(0, 0, Step.Z > 0 ? -1 : 1);
-            }
 
             return true;
         }
 
-        // Advance to next voxel
         if (TMax.X < TMax.Y)
         {
             if (TMax.X < TMax.Z)
@@ -744,6 +998,10 @@ bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, 
     return false;
 }
 
+// ==========================================
+// Statistics and Performance
+// ==========================================
+
 void AVoxelWorldManager::GetChunkStats(int32& OutLoadedChunks, int32& OutPendingChunks, int32& OutTotalVoxels) const
 {
     OutLoadedChunks = LoadedChunks.Num();
@@ -751,4 +1009,60 @@ void AVoxelWorldManager::GetChunkStats(int32& OutLoadedChunks, int32& OutPending
 
     int32 VoxelsPerChunk = WorldSettings.ChunkSize * WorldSettings.ChunkSize * WorldSettings.ChunkSize;
     OutTotalVoxels = OutLoadedChunks * VoxelsPerChunk;
+}
+
+float AVoxelWorldManager::GetMemoryUsageMB() const
+{
+    int64 TotalBytes = 0;
+
+    for (const auto& Pair : LoadedChunks)
+    {
+        if (Pair.Value && IsValid(Pair.Value))
+        {
+            TotalBytes += Pair.Value->GetMemoryUsage();
+        }
+    }
+
+    // Add pool memory
+    for (const auto& Chunk : ChunkPool)
+    {
+        if (Chunk && IsValid(Chunk))
+        {
+            TotalBytes += Chunk->GetMemoryUsage();
+        }
+    }
+
+    return static_cast<float>(TotalBytes) / (1024.0f * 1024.0f);
+}
+
+void AVoxelWorldManager::ForceCleanup()
+{
+    UE_LOG(LogVoxelWorld, Log, TEXT("ForceCleanup called - compacting memory..."));
+
+    // Compact memory in all loaded chunks
+    for (auto& Pair : LoadedChunks)
+    {
+        if (Pair.Value && IsValid(Pair.Value))
+        {
+            Pair.Value->CompactMemory();
+        }
+    }
+
+    // Clear the chunk pool entirely
+    for (auto& Chunk : ChunkPool)
+    {
+        if (Chunk && IsValid(Chunk))
+        {
+            Chunk->Destroy();
+        }
+    }
+    ChunkPool.Empty();
+
+    // Request garbage collection
+    if (GEngine)
+    {
+        GEngine->ForceGarbageCollection(true);
+    }
+
+    UE_LOG(LogVoxelWorld, Log, TEXT("ForceCleanup complete - Memory usage: %.2f MB"), GetMemoryUsageMB());
 }

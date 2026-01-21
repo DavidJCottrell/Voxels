@@ -9,19 +9,22 @@ AVoxelChunk::AVoxelChunk()
 {
     PrimaryActorTick.bCanEverTick = false;
 
-    // Create mesh component
+    // Create mesh component with optimized settings
     MeshComponent = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("MeshComponent"));
     MeshComponent->bUseAsyncCooking = true;
     MeshComponent->SetCastShadow(true);
-    MeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+    // Start with collision DISABLED - we'll enable it only for nearby chunks
+    MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     MeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
-    
+    bCollisionEnabled = false;
+
     RootComponent = MeshComponent;
 }
 
 AVoxelChunk::~AVoxelChunk()
 {
-    // MarchingCubes TUniquePtr will auto-cleanup
+    // TUniquePtr auto-cleanup for MarchingCubes
 }
 
 void AVoxelChunk::BeginPlay()
@@ -29,26 +32,50 @@ void AVoxelChunk::BeginPlay()
     Super::BeginPlay();
 }
 
+void AVoxelChunk::BeginDestroy()
+{
+    // Mark as pending kill for async safety
+    bPendingKill = true;
+
+    // Clear mesh first to release render resources
+    ClearMesh();
+
+    // Clear data arrays
+    DensityData.Empty();
+    MaterialData.Empty();
+
+    // Clear neighbor references
+    NeighborXPos.Reset();
+    NeighborXNeg.Reset();
+    NeighborYPos.Reset();
+    NeighborYNeg.Reset();
+    NeighborZPos.Reset();
+    NeighborZNeg.Reset();
+
+    Super::BeginDestroy();
+}
+
 void AVoxelChunk::InitializeChunk(const FChunkCoord& InChunkCoord, const FVoxelWorldSettings& InSettings, UVoxelTerrainGenerator* InGenerator)
 {
     ChunkCoord = InChunkCoord;
     WorldSettings = InSettings;
     TerrainGenerator = InGenerator;
+    ChunkState = EChunkState::Loading;
 
     int32 ChunkSize = WorldSettings.ChunkSize;
 
-    // Allocate density data (ChunkSize+1 to include boundary for interpolation)
+    // Pre-allocate density data (ChunkSize+1 for interpolation)
     int32 DensitySize = (ChunkSize + 1) * (ChunkSize + 1) * (ChunkSize + 1);
     DensityData.SetNum(DensitySize);
 
-    // Allocate material data
+    // Pre-allocate material data
     int32 MaterialSize = ChunkSize * ChunkSize * ChunkSize;
     MaterialData.SetNum(MaterialSize);
 
     // Create marching cubes mesher
     MarchingCubes = MakeUnique<FVoxelMarchingCubes>(ChunkSize, WorldSettings.VoxelSize);
 
-    // Set actor position in world space
+    // Set actor position
     FVector WorldPosition(
         ChunkCoord.X * ChunkSize * WorldSettings.VoxelSize,
         ChunkCoord.Y * ChunkSize * WorldSettings.VoxelSize,
@@ -58,10 +85,50 @@ void AVoxelChunk::InitializeChunk(const FChunkCoord& InChunkCoord, const FVoxelW
 
     bIsGenerated = false;
     bNeedsMeshRebuild = true;
+    bHasVoxelData = true;
+    bPendingKill = false;
+}
+
+void AVoxelChunk::ResetChunk()
+{
+    // Reset for pooling - keep allocations but clear data
+    ChunkState = EChunkState::Unloaded;
+    bIsGenerated = false;
+    bNeedsMeshRebuild = true;
+    bHasVoxelData = false;
+    bPendingKill = false;
+    CurrentLOD = EVoxelLOD::LOD0;
+
+    // Clear mesh
+    ClearMesh();
+
+    // Zero out data but keep allocations
+    if (DensityData.Num() > 0)
+    {
+        FMemory::Memzero(DensityData.GetData(), DensityData.Num() * sizeof(float));
+    }
+    if (MaterialData.Num() > 0)
+    {
+        FMemory::Memzero(MaterialData.GetData(), MaterialData.Num() * sizeof(EVoxelType));
+    }
+
+    // Clear neighbor references
+    NeighborXPos.Reset();
+    NeighborXNeg.Reset();
+    NeighborYPos.Reset();
+    NeighborYNeg.Reset();
+    NeighborZPos.Reset();
+    NeighborZNeg.Reset();
 }
 
 void AVoxelChunk::GenerateVoxelData()
 {
+    // Check for cancellation
+    if (bPendingKill)
+    {
+        return;
+    }
+
     if (!TerrainGenerator)
     {
         UE_LOG(LogVoxelWorld, Warning, TEXT("Chunk %s: No terrain generator assigned!"), *ChunkCoord.ToString());
@@ -70,15 +137,16 @@ void AVoxelChunk::GenerateVoxelData()
 
     int32 ChunkSize = WorldSettings.ChunkSize;
 
-    // Calculate world position of chunk origin
     int32 ChunkWorldX = ChunkCoord.X * ChunkSize;
     int32 ChunkWorldY = ChunkCoord.Y * ChunkSize;
     int32 ChunkWorldZ = ChunkCoord.Z * ChunkSize;
 
-    // Generate density data (SDF values)
-    // We need ChunkSize+1 samples per dimension for marching cubes
+    // Generate density data
     for (int32 LocalZ = 0; LocalZ <= ChunkSize; ++LocalZ)
     {
+        // Check for cancellation periodically
+        if (bPendingKill) return;
+
         int32 WorldZ = ChunkWorldZ + LocalZ;
 
         for (int32 LocalY = 0; LocalY <= ChunkSize; ++LocalY)
@@ -89,9 +157,7 @@ void AVoxelChunk::GenerateVoxelData()
             {
                 int32 WorldX = ChunkWorldX + LocalX;
 
-                // Get density from terrain generator
                 float Density = TerrainGenerator->GetDensity(WorldX, WorldY, WorldZ);
-
                 int32 Index = GetDensityIndex(LocalX, LocalY, LocalZ);
                 DensityData[Index] = Density;
             }
@@ -101,6 +167,8 @@ void AVoxelChunk::GenerateVoxelData()
     // Generate material data
     for (int32 LocalZ = 0; LocalZ < ChunkSize; ++LocalZ)
     {
+        if (bPendingKill) return;
+
         int32 WorldZ = ChunkWorldZ + LocalZ;
 
         for (int32 LocalY = 0; LocalY < ChunkSize; ++LocalY)
@@ -111,9 +179,7 @@ void AVoxelChunk::GenerateVoxelData()
             {
                 int32 WorldX = ChunkWorldX + LocalX;
 
-                // Get material type from terrain generator
                 EVoxelType Material = TerrainGenerator->GetVoxelType(WorldX, WorldY, WorldZ);
-
                 int32 Index = GetMaterialIndex(LocalX, LocalY, LocalZ);
                 MaterialData[Index] = Material;
             }
@@ -121,7 +187,9 @@ void AVoxelChunk::GenerateVoxelData()
     }
 
     bIsGenerated = true;
+    bHasVoxelData = true;
     bNeedsMeshRebuild = true;
+    ChunkState = EChunkState::Generated;
 
     UE_LOG(LogVoxelWorld, Verbose, TEXT("Generated voxel data for chunk %s"), *ChunkCoord.ToString());
 }
@@ -138,17 +206,15 @@ void AVoxelChunk::SetNeighbors(AVoxelChunk* XPos, AVoxelChunk* XNeg, AVoxelChunk
 
 FVoxel AVoxelChunk::GetVoxel(int32 LocalX, int32 LocalY, int32 LocalZ) const
 {
-    if (!IsInBounds(LocalX, LocalY, LocalZ))
+    if (!IsInBounds(LocalX, LocalY, LocalZ) || !bHasVoxelData)
     {
         return FVoxel(EVoxelType::Air);
     }
 
-    // For smooth terrain, we derive voxel from density
     float Density = GetDensity(LocalX, LocalY, LocalZ);
     EVoxelType Material = GetMaterial(LocalX, LocalY, LocalZ);
 
     FVoxel Voxel(Material);
-    // Convert density to 0-255 range for compatibility
     Voxel.Density = static_cast<uint8>(FMath::Clamp((1.0f - Density) * 127.5f + 127.5f, 0.0f, 255.0f));
 
     return Voxel;
@@ -156,19 +222,16 @@ FVoxel AVoxelChunk::GetVoxel(int32 LocalX, int32 LocalY, int32 LocalZ) const
 
 void AVoxelChunk::SetVoxel(int32 LocalX, int32 LocalY, int32 LocalZ, const FVoxel& Voxel)
 {
-    if (!IsInBounds(LocalX, LocalY, LocalZ))
+    if (!IsInBounds(LocalX, LocalY, LocalZ) || !bHasVoxelData)
     {
         return;
     }
 
-    // Set material
     SetMaterial(LocalX, LocalY, LocalZ, Voxel.Type);
 
-    // Convert density from 0-255 to -1 to 1 range
     float Density = (static_cast<float>(Voxel.Density) - 127.5f) / 127.5f;
-    Density = -Density; // Invert so higher values = more solid
+    Density = -Density;
 
-    // Set density at this voxel's corner
     SetDensity(LocalX, LocalY, LocalZ, Density);
 
     bNeedsMeshRebuild = true;
@@ -176,9 +239,9 @@ void AVoxelChunk::SetVoxel(int32 LocalX, int32 LocalY, int32 LocalZ, const FVoxe
 
 float AVoxelChunk::GetDensity(int32 LocalX, int32 LocalY, int32 LocalZ) const
 {
-    if (!IsInDensityBounds(LocalX, LocalY, LocalZ))
+    if (!IsInDensityBounds(LocalX, LocalY, LocalZ) || !bHasVoxelData)
     {
-        return 1.0f; // Outside = air
+        return 1.0f;
     }
 
     int32 Index = GetDensityIndex(LocalX, LocalY, LocalZ);
@@ -192,7 +255,7 @@ float AVoxelChunk::GetDensity(int32 LocalX, int32 LocalY, int32 LocalZ) const
 
 void AVoxelChunk::SetDensity(int32 LocalX, int32 LocalY, int32 LocalZ, float Density)
 {
-    if (!IsInDensityBounds(LocalX, LocalY, LocalZ))
+    if (!IsInDensityBounds(LocalX, LocalY, LocalZ) || !bHasVoxelData)
     {
         return;
     }
@@ -207,7 +270,7 @@ void AVoxelChunk::SetDensity(int32 LocalX, int32 LocalY, int32 LocalZ, float Den
 
 EVoxelType AVoxelChunk::GetMaterial(int32 LocalX, int32 LocalY, int32 LocalZ) const
 {
-    if (!IsInBounds(LocalX, LocalY, LocalZ))
+    if (!IsInBounds(LocalX, LocalY, LocalZ) || !bHasVoxelData)
     {
         return EVoxelType::Air;
     }
@@ -223,7 +286,7 @@ EVoxelType AVoxelChunk::GetMaterial(int32 LocalX, int32 LocalY, int32 LocalZ) co
 
 void AVoxelChunk::SetMaterial(int32 LocalX, int32 LocalY, int32 LocalZ, EVoxelType Material)
 {
-    if (!IsInBounds(LocalX, LocalY, LocalZ))
+    if (!IsInBounds(LocalX, LocalY, LocalZ) || !bHasVoxelData)
     {
         return;
     }
@@ -240,45 +303,25 @@ float AVoxelChunk::GetDensityIncludingNeighbors(int32 LocalX, int32 LocalY, int3
 {
     int32 ChunkSize = WorldSettings.ChunkSize;
 
-    // Check if within this chunk's density bounds
     if (IsInDensityBounds(LocalX, LocalY, LocalZ))
     {
         return GetDensity(LocalX, LocalY, LocalZ);
     }
 
     // Check neighbors
-    // +X neighbor
     if (LocalX > ChunkSize && NeighborXPos.IsValid())
-    {
         return NeighborXPos->GetDensity(LocalX - ChunkSize, LocalY, LocalZ);
-    }
-    // -X neighbor
     if (LocalX < 0 && NeighborXNeg.IsValid())
-    {
         return NeighborXNeg->GetDensity(LocalX + ChunkSize, LocalY, LocalZ);
-    }
-    // +Y neighbor
     if (LocalY > ChunkSize && NeighborYPos.IsValid())
-    {
         return NeighborYPos->GetDensity(LocalX, LocalY - ChunkSize, LocalZ);
-    }
-    // -Y neighbor
     if (LocalY < 0 && NeighborYNeg.IsValid())
-    {
         return NeighborYNeg->GetDensity(LocalX, LocalY + ChunkSize, LocalZ);
-    }
-    // +Z neighbor
     if (LocalZ > ChunkSize && NeighborZPos.IsValid())
-    {
         return NeighborZPos->GetDensity(LocalX, LocalY, LocalZ - ChunkSize);
-    }
-    // -Z neighbor
     if (LocalZ < 0 && NeighborZNeg.IsValid())
-    {
         return NeighborZNeg->GetDensity(LocalX, LocalY, LocalZ + ChunkSize);
-    }
 
-    // Default to air if no neighbor
     return 1.0f;
 }
 
@@ -286,55 +329,40 @@ EVoxelType AVoxelChunk::GetMaterialIncludingNeighbors(int32 LocalX, int32 LocalY
 {
     int32 ChunkSize = WorldSettings.ChunkSize;
 
-    // Check if within this chunk's bounds
     if (IsInBounds(LocalX, LocalY, LocalZ))
     {
         return GetMaterial(LocalX, LocalY, LocalZ);
     }
 
-    // Check neighbors
     if (LocalX >= ChunkSize && NeighborXPos.IsValid())
-    {
         return NeighborXPos->GetMaterial(LocalX - ChunkSize, LocalY, LocalZ);
-    }
     if (LocalX < 0 && NeighborXNeg.IsValid())
-    {
         return NeighborXNeg->GetMaterial(LocalX + ChunkSize, LocalY, LocalZ);
-    }
     if (LocalY >= ChunkSize && NeighborYPos.IsValid())
-    {
         return NeighborYPos->GetMaterial(LocalX, LocalY - ChunkSize, LocalZ);
-    }
     if (LocalY < 0 && NeighborYNeg.IsValid())
-    {
         return NeighborYNeg->GetMaterial(LocalX, LocalY + ChunkSize, LocalZ);
-    }
     if (LocalZ >= ChunkSize && NeighborZPos.IsValid())
-    {
         return NeighborZPos->GetMaterial(LocalX, LocalY, LocalZ - ChunkSize);
-    }
     if (LocalZ < 0 && NeighborZNeg.IsValid())
-    {
         return NeighborZNeg->GetMaterial(LocalX, LocalY, LocalZ + ChunkSize);
-    }
 
     return EVoxelType::Air;
 }
 
 void AVoxelChunk::ModifyTerrain(const FVector& LocalPosition, float Radius, float Strength, bool bAdd)
 {
+    if (!bHasVoxelData) return;
+
     int32 ChunkSize = WorldSettings.ChunkSize;
     float VoxelSize = WorldSettings.VoxelSize;
 
-    // Convert world-space radius to voxel units
     int32 VoxelRadius = FMath::CeilToInt(Radius / VoxelSize) + 1;
 
-    // Convert local position to voxel coordinates
     int32 CenterX = FMath::FloorToInt(LocalPosition.X / VoxelSize);
     int32 CenterY = FMath::FloorToInt(LocalPosition.Y / VoxelSize);
     int32 CenterZ = FMath::FloorToInt(LocalPosition.Z / VoxelSize);
 
-    // Modify density in sphere
     for (int32 Z = CenterZ - VoxelRadius; Z <= CenterZ + VoxelRadius; ++Z)
     {
         for (int32 Y = CenterY - VoxelRadius; Y <= CenterY + VoxelRadius; ++Y)
@@ -342,17 +370,13 @@ void AVoxelChunk::ModifyTerrain(const FVector& LocalPosition, float Radius, floa
             for (int32 X = CenterX - VoxelRadius; X <= CenterX + VoxelRadius; ++X)
             {
                 if (!IsInDensityBounds(X, Y, Z))
-                {
                     continue;
-                }
 
-                // Calculate distance from center
                 FVector VoxelPos(X * VoxelSize, Y * VoxelSize, Z * VoxelSize);
                 float Distance = FVector::Dist(VoxelPos, LocalPosition);
 
                 if (Distance <= Radius)
                 {
-                    // Calculate falloff (smooth blend at edges)
                     float Falloff = 1.0f - (Distance / Radius);
                     Falloff = FMath::SmoothStep(0.0f, 1.0f, Falloff);
 
@@ -362,17 +386,10 @@ void AVoxelChunk::ModifyTerrain(const FVector& LocalPosition, float Radius, floa
                     if (Index >= 0 && Index < DensityData.Num())
                     {
                         if (bAdd)
-                        {
-                            // Adding terrain = decrease density (more solid)
                             DensityData[Index] -= DensityChange;
-                        }
                         else
-                        {
-                            // Removing terrain = increase density (more air)
                             DensityData[Index] += DensityChange;
-                        }
 
-                        // Clamp density to reasonable range
                         DensityData[Index] = FMath::Clamp(DensityData[Index], -1.0f, 1.0f);
                     }
                 }
@@ -381,6 +398,91 @@ void AVoxelChunk::ModifyTerrain(const FVector& LocalPosition, float Radius, floa
     }
 
     bNeedsMeshRebuild = true;
+}
+
+void AVoxelChunk::SetLOD(EVoxelLOD NewLOD)
+{
+    if (CurrentLOD != NewLOD)
+    {
+        CurrentLOD = NewLOD;
+        bNeedsMeshRebuild = true;
+    }
+}
+
+void AVoxelChunk::SetCollisionEnabled(bool bEnabled)
+{
+    if (bCollisionEnabled != bEnabled)
+    {
+        bCollisionEnabled = bEnabled;
+
+        if (MeshComponent)
+        {
+            if (bEnabled)
+            {
+                MeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+            }
+            else
+            {
+                MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+            }
+        }
+    }
+}
+
+void AVoxelChunk::UnloadVoxelData()
+{
+    if (!bHasVoxelData) return;
+
+    // Free memory
+    DensityData.Empty();
+    MaterialData.Empty();
+
+    bHasVoxelData = false;
+
+    UE_LOG(LogVoxelWorld, Verbose, TEXT("Unloaded voxel data for chunk %s"), *ChunkCoord.ToString());
+}
+
+void AVoxelChunk::ReloadVoxelData()
+{
+    if (bHasVoxelData) return;
+
+    // Re-allocate and regenerate
+    int32 ChunkSize = WorldSettings.ChunkSize;
+    int32 DensitySize = (ChunkSize + 1) * (ChunkSize + 1) * (ChunkSize + 1);
+    int32 MaterialSize = ChunkSize * ChunkSize * ChunkSize;
+
+    DensityData.SetNum(DensitySize);
+    MaterialData.SetNum(MaterialSize);
+
+    bHasVoxelData = true;
+    bIsGenerated = false;
+
+    // Regenerate data
+    GenerateVoxelData();
+}
+
+int64 AVoxelChunk::GetMemoryUsage() const
+{
+    int64 TotalBytes = 0;
+
+    TotalBytes += DensityData.GetAllocatedSize();
+    TotalBytes += MaterialData.GetAllocatedSize();
+
+    // Estimate mesh memory (rough approximation)
+    if (MeshComponent && MeshComponent->GetProcMeshSection(0))
+    {
+        auto* Section = MeshComponent->GetProcMeshSection(0);
+        TotalBytes += Section->ProcVertexBuffer.GetAllocatedSize();
+        TotalBytes += Section->ProcIndexBuffer.GetAllocatedSize();
+    }
+
+    return TotalBytes;
+}
+
+void AVoxelChunk::CompactMemory()
+{
+    DensityData.Shrink();
+    MaterialData.Shrink();
 }
 
 FColor AVoxelChunk::GetVoxelColor(EVoxelType Type) const
@@ -402,9 +504,24 @@ FColor AVoxelChunk::GetVoxelColor(EVoxelType Type) const
     }
 }
 
+void AVoxelChunk::ClearMesh()
+{
+    if (MeshComponent)
+    {
+        MeshComponent->ClearAllMeshSections();
+    }
+}
+
 void AVoxelChunk::BuildMesh()
 {
-    if (!bIsGenerated)
+    BuildMeshWithLOD(CurrentLOD);
+}
+
+void AVoxelChunk::BuildMeshWithLOD(EVoxelLOD LODLevel)
+{
+    if (bPendingKill) return;
+
+    if (!bIsGenerated || !bHasVoxelData)
     {
         UE_LOG(LogVoxelWorld, Warning, TEXT("Chunk %s: Cannot build mesh - voxels not generated!"), *ChunkCoord.ToString());
         return;
@@ -418,6 +535,9 @@ void AVoxelChunk::BuildMesh()
 
     FVoxelMeshData MeshData;
 
+    // Get step size for LOD
+    int32 StepSize = FVoxelLODSettings::GetStepSizeForLOD(LODLevel);
+
     // Create lambda functions for neighbor access
     auto GetNeighborDensity = [this](int32 X, int32 Y, int32 Z) -> float
     {
@@ -429,13 +549,15 @@ void AVoxelChunk::BuildMesh()
         return GetMaterialIncludingNeighbors(X, Y, Z);
     };
 
-    // Generate mesh using Marching Cubes
-    MarchingCubes->GenerateMesh(
+    // Generate mesh with LOD
+    MarchingCubes->GenerateMeshLOD(
         DensityData,
         MaterialData,
         GetNeighborDensity,
         GetNeighborMaterial,
-        MeshData
+        MeshData,
+        StepSize,
+        WorldSettings.bDeduplicateVertices
     );
 
     // Clear existing mesh
@@ -444,6 +566,10 @@ void AVoxelChunk::BuildMesh()
     // Create mesh if we have data
     if (!MeshData.IsEmpty())
     {
+        // Shrink arrays to save memory
+        MeshData.Shrink();
+
+        // Create mesh section - collision only if enabled for this chunk
         MeshComponent->CreateMeshSection(
             0,
             MeshData.Vertices,
@@ -452,15 +578,28 @@ void AVoxelChunk::BuildMesh()
             MeshData.UVs,
             MeshData.VertexColors,
             MeshData.Tangents,
-            true // Create collision
+            bCollisionEnabled  // Only create collision for nearby chunks!
         );
 
-        // Enable collision
-        MeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        // Set collision state
+        if (bCollisionEnabled)
+        {
+            MeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        }
+        else
+        {
+            MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        }
     }
 
     bNeedsMeshRebuild = false;
+    ChunkState = EChunkState::Meshed;
+    CurrentLOD = LODLevel;
 
-    UE_LOG(LogVoxelWorld, Verbose, TEXT("Built mesh for chunk %s: %d vertices, %d triangles"),
-        *ChunkCoord.ToString(), MeshData.Vertices.Num(), MeshData.Triangles.Num() / 3);
+    UE_LOG(LogVoxelWorld, Verbose, TEXT("Built mesh for chunk %s (LOD%d): %d vertices, %d triangles, collision=%s"),
+        *ChunkCoord.ToString(),
+        static_cast<int32>(LODLevel),
+        MeshData.Vertices.Num(),
+        MeshData.Triangles.Num() / 3,
+        bCollisionEnabled ? TEXT("ON") : TEXT("OFF"));
 }
