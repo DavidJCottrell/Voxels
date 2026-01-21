@@ -1,0 +1,24 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "Voxel World Generator",
+    "Description": "A high-performance voxel-based procedural world generation system with chunk management, LOD support, and customizable terrain generation.",
+    "Category": "Procedural Generation",
+    "CreatedBy": "Your Name",
+    "CreatedByURL": "",
+    "DocsURL": "",
+    "MarketplaceURL": "",
+    "SupportURL": "",
+    "CanContainContent": true,
+    "IsBetaVersion": false,
+    "IsExperimentalVersion": false,
+    "Installed": false,
+    "Modules": [
+        {
+            "Name": "VoxelWorld",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        }
+    ]
+}
