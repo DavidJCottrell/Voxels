@@ -7,6 +7,10 @@
 #include "Async/Async.h"
 #include "Engine/World.h"
 
+#if WITH_EDITOR
+#include "Editor.h"
+#endif
+
 void FChunkGenerationTask::DoWork()
 {
     if (Chunk && IsValid(Chunk))
@@ -25,6 +29,14 @@ void AVoxelWorldManager::BeginPlay()
 {
     Super::BeginPlay();
 
+    // Clear any editor preview chunks when starting play
+    if (bIsEditorPreview)
+    {
+        DestroyAllChunks();
+        bIsEditorPreview = false;
+        bIsInitialized = false;
+    }
+
     // Auto-initialize if not done manually
     if (!bIsInitialized)
     {
@@ -35,18 +47,171 @@ void AVoxelWorldManager::BeginPlay()
 void AVoxelWorldManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     // Clean up all chunks
-    for (auto& Pair : LoadedChunks)
-    {
-        if (Pair.Value && IsValid(Pair.Value))
-        {
-            Pair.Value->Destroy();
-        }
-    }
-    LoadedChunks.Empty();
-    ChunkGenerationQueue.Empty();
-    MeshBuildQueue.Empty();
+    DestroyAllChunks();
 
     Super::EndPlay(EndPlayReason);
+}
+
+void AVoxelWorldManager::OnConstruction(const FTransform& Transform)
+{
+    Super::OnConstruction(Transform);
+
+#if WITH_EDITOR
+    // Only generate preview if enabled and we're in the editor (not playing)
+    if (bEnableEditorPreview && IsInEditorPreviewMode())
+    {
+        // Delay initialization to avoid issues during construction
+        if (!bIsInitialized)
+        {
+            InitializeEditorPreview();
+        }
+    }
+    else if (!bEnableEditorPreview && bIsEditorPreview)
+    {
+        // Clear preview if it was disabled
+        ClearEditorPreview();
+    }
+#endif
+}
+
+bool AVoxelWorldManager::ShouldTickIfViewportsOnly() const
+{
+    // Allow ticking in editor when preview is enabled
+    return bEnableEditorPreview && bIsEditorPreview;
+}
+
+#if WITH_EDITOR
+void AVoxelWorldManager::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+    Super::PostEditChangeProperty(PropertyChangedEvent);
+
+    FName PropertyName = (PropertyChangedEvent.Property != nullptr)
+        ? PropertyChangedEvent.Property->GetFName()
+        : NAME_None;
+
+    // Check if editor preview was toggled
+    if (PropertyName == GET_MEMBER_NAME_CHECKED(AVoxelWorldManager, bEnableEditorPreview))
+    {
+        if (bEnableEditorPreview)
+        {
+            RegenerateEditorPreview();
+        }
+        else
+        {
+            ClearEditorPreview();
+        }
+        return;
+    }
+
+    // Check if preview distance changed
+    if (PropertyName == GET_MEMBER_NAME_CHECKED(AVoxelWorldManager, EditorPreviewDistance))
+    {
+        if (bEnableEditorPreview && bAutoRegeneratePreview)
+        {
+            RegenerateEditorPreview();
+        }
+        return;
+    }
+
+    // Check if any world settings changed
+    if (PropertyChangedEvent.MemberProperty != nullptr)
+    {
+        FName MemberName = PropertyChangedEvent.MemberProperty->GetFName();
+        if (MemberName == GET_MEMBER_NAME_CHECKED(AVoxelWorldManager, WorldSettings))
+        {
+            if (bEnableEditorPreview && bAutoRegeneratePreview)
+            {
+                RegenerateEditorPreview();
+            }
+        }
+    }
+}
+
+bool AVoxelWorldManager::IsInEditorPreviewMode() const
+{
+    // Check if we're in editor and not playing
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return false;
+    }
+
+    // Check for editor world
+    if (World->WorldType == EWorldType::Editor || World->WorldType == EWorldType::EditorPreview)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+void AVoxelWorldManager::InitializeEditorPreview()
+{
+    if (bIsInitialized)
+    {
+        return;
+    }
+
+    UE_LOG(LogVoxelWorld, Log, TEXT("Initializing editor preview..."));
+
+    // Create terrain generator
+    TerrainGenerator = NewObject<UVoxelTerrainGenerator>(this);
+    TerrainGenerator->Initialize(WorldSettings);
+
+    // Use actor's position as the center for preview
+    CurrentLoadCenter = WorldToChunkCoord(GetActorLocation());
+    bIsInitialized = true;
+    bIsEditorPreview = true;
+
+    // Start loading chunks around the actor
+    UpdateChunkLoading();
+}
+#endif
+
+void AVoxelWorldManager::RegenerateEditorPreview()
+{
+#if WITH_EDITOR
+    if (!IsInEditorPreviewMode())
+    {
+        UE_LOG(LogVoxelWorld, Warning, TEXT("Cannot regenerate preview - not in editor mode"));
+        return;
+    }
+
+    UE_LOG(LogVoxelWorld, Log, TEXT("Regenerating editor preview..."));
+
+    // Clear existing chunks
+    DestroyAllChunks();
+    bIsInitialized = false;
+    bIsEditorPreview = false;
+
+    // Reinitialize
+    if (bEnableEditorPreview)
+    {
+        InitializeEditorPreview();
+    }
+#endif
+}
+
+void AVoxelWorldManager::ClearEditorPreview()
+{
+#if WITH_EDITOR
+    UE_LOG(LogVoxelWorld, Log, TEXT("Clearing editor preview..."));
+
+    DestroyAllChunks();
+    bIsInitialized = false;
+    bIsEditorPreview = false;
+#endif
+}
+
+int32 AVoxelWorldManager::GetEffectiveRenderDistance() const
+{
+#if WITH_EDITOR
+    if (bIsEditorPreview)
+    {
+        return EditorPreviewDistance;
+    }
+#endif
+    return WorldSettings.RenderDistance;
 }
 
 void AVoxelWorldManager::InitializeWorld()
@@ -63,6 +228,7 @@ void AVoxelWorldManager::InitializeWorld()
 
     CurrentLoadCenter = FChunkCoord(0, 0, 0);
     bIsInitialized = true;
+    bIsEditorPreview = false;
 
     UE_LOG(LogVoxelWorld, Log, TEXT("Voxel World initialized with seed %d, chunk size %d, render distance %d"),
         WorldSettings.Seed, WorldSettings.ChunkSize, WorldSettings.RenderDistance);
@@ -159,7 +325,7 @@ void AVoxelWorldManager::SetVoxelAtWorldPosition(const FVector& WorldPosition, c
     if (Chunk && Chunk->IsGenerated())
     {
         Chunk->SetVoxel(LocalX, LocalY, LocalZ, Voxel);
-        
+
         // Add to mesh rebuild queue if not already there
         if (!MeshBuildQueue.Contains(Chunk))
         {
@@ -216,13 +382,13 @@ float AVoxelWorldManager::GetTerrainHeightAtWorldPosition(float WorldX, float Wo
     int32 VoxelX = FMath::FloorToInt(WorldX / WorldSettings.VoxelSize);
     int32 VoxelY = FMath::FloorToInt(WorldY / WorldSettings.VoxelSize);
 
-    int32 TerrainHeight = TerrainGenerator->GetTerrainHeight(VoxelX, VoxelY);
+    float TerrainHeight = TerrainGenerator->GetTerrainHeight(VoxelX, VoxelY);
     return TerrainHeight * WorldSettings.VoxelSize;
 }
 
 void AVoxelWorldManager::UpdateChunkLoading()
 {
-    int32 RenderDist = WorldSettings.RenderDistance;
+    int32 RenderDist = GetEffectiveRenderDistance();
     int32 HeightChunks = WorldSettings.WorldHeightChunks;
 
     // Determine which chunks should be loaded
@@ -236,7 +402,7 @@ void AVoxelWorldManager::UpdateChunkLoading()
             {
                 FChunkCoord Coord(X, Y, Z);
                 float Distance = GetChunkDistanceFromCenter(Coord);
-                
+
                 if (Distance <= RenderDist)
                 {
                     ChunksToKeep.Add(Coord);
@@ -277,15 +443,38 @@ AVoxelChunk* AVoxelWorldManager::CreateChunk(const FChunkCoord& ChunkCoord)
         return LoadedChunks[ChunkCoord];
     }
 
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return nullptr;
+    }
+
     FActorSpawnParameters SpawnParams;
     SpawnParams.Owner = this;
 
-    AVoxelChunk* NewChunk = GetWorld()->SpawnActor<AVoxelChunk>(AVoxelChunk::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
-    
+#if WITH_EDITOR
+    // In editor, spawn chunks that won't be saved with the level
+    if (bIsEditorPreview)
+    {
+        SpawnParams.ObjectFlags |= RF_Transient;
+    }
+#endif
+
+    AVoxelChunk* NewChunk = World->SpawnActor<AVoxelChunk>(AVoxelChunk::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+
     if (NewChunk)
     {
+#if WITH_EDITOR
+        // Mark as hidden from outliner in editor preview
+        if (bIsEditorPreview)
+        {
+            NewChunk->SetFlags(RF_Transient);
+            NewChunk->SetActorLabel(FString::Printf(TEXT("PreviewChunk_%s"), *ChunkCoord.ToString()));
+        }
+#endif
+
         NewChunk->InitializeChunk(ChunkCoord, WorldSettings, TerrainGenerator);
-        
+
         // Apply material if set
         if (VoxelMaterial)
         {
@@ -310,26 +499,57 @@ void AVoxelWorldManager::DestroyChunk(const FChunkCoord& ChunkCoord)
     {
         // Remove from mesh build queue
         MeshBuildQueue.Remove(*ChunkPtr);
-        
+
         (*ChunkPtr)->Destroy();
         LoadedChunks.Remove(ChunkCoord);
     }
+}
+
+void AVoxelWorldManager::DestroyAllChunks()
+{
+    for (auto& Pair : LoadedChunks)
+    {
+        if (Pair.Value && IsValid(Pair.Value))
+        {
+            Pair.Value->Destroy();
+        }
+    }
+    LoadedChunks.Empty();
+    ChunkGenerationQueue.Empty();
+    MeshBuildQueue.Empty();
 }
 
 void AVoxelWorldManager::ProcessGenerationQueue()
 {
     int32 ChunksProcessed = 0;
 
-    while (ChunkGenerationQueue.Num() > 0 && ChunksProcessed < WorldSettings.ChunksPerFrame)
+    // In editor preview, process more chunks per frame for faster preview
+    int32 MaxChunksPerFrame = WorldSettings.ChunksPerFrame;
+#if WITH_EDITOR
+    if (bIsEditorPreview)
+    {
+        MaxChunksPerFrame = FMath::Max(MaxChunksPerFrame, 8);
+    }
+#endif
+
+    while (ChunkGenerationQueue.Num() > 0 && ChunksProcessed < MaxChunksPerFrame)
     {
         FChunkCoord Coord = ChunkGenerationQueue[0];
         ChunkGenerationQueue.RemoveAt(0);
 
         // Create chunk if not exists
         AVoxelChunk* Chunk = CreateChunk(Coord);
-        
+
         if (Chunk && !Chunk->IsGenerated())
         {
+            // In editor preview, always use synchronous generation for reliability
+#if WITH_EDITOR
+            if (bIsEditorPreview)
+            {
+                Chunk->GenerateVoxelData();
+            }
+            else
+#endif
             if (WorldSettings.bAsyncGeneration)
             {
                 // Async generation
@@ -340,7 +560,7 @@ void AVoxelWorldManager::ProcessGenerationQueue()
                 // Synchronous generation
                 Chunk->GenerateVoxelData();
             }
-            
+
             // Add to mesh build queue
             MeshBuildQueue.Add(Chunk);
             ChunksProcessed++;
@@ -353,7 +573,16 @@ void AVoxelWorldManager::ProcessMeshBuildQueue()
     int32 MeshesBuilt = 0;
     TArray<AVoxelChunk*> ChunksToRequeue;
 
-    while (MeshBuildQueue.Num() > 0 && MeshesBuilt < WorldSettings.ChunksPerFrame)
+    // In editor preview, process more meshes per frame
+    int32 MaxMeshesPerFrame = WorldSettings.ChunksPerFrame;
+#if WITH_EDITOR
+    if (bIsEditorPreview)
+    {
+        MaxMeshesPerFrame = FMath::Max(MaxMeshesPerFrame, 8);
+    }
+#endif
+
+    while (MeshBuildQueue.Num() > 0 && MeshesBuilt < MaxMeshesPerFrame)
     {
         AVoxelChunk* Chunk = MeshBuildQueue[0];
         MeshBuildQueue.RemoveAt(0);
@@ -433,7 +662,7 @@ bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, 
 
     // Calculate initial t values
     FVector TMax, TDelta;
-    
+
     auto GetTMax = [&](float Pos, float Dir, float StepDir) -> float
     {
         if (FMath::Abs(Dir) < SMALL_NUMBER) return MAX_FLT;
@@ -456,12 +685,12 @@ bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, 
     for (int32 Step_ = 0; Step_ < MaxSteps && T < MaxDistance; ++Step_)
     {
         FVoxel Voxel = GetVoxelAtWorldPosition(CurrentPos);
-        
+
         if (Voxel.IsSolid())
         {
             OutHitPosition = CurrentPos;
             OutHitVoxel = Voxel;
-            
+
             // Determine hit normal based on which face was hit
             if (TMax.X < TMax.Y && TMax.X < TMax.Z)
             {
@@ -475,7 +704,7 @@ bool AVoxelWorldManager::VoxelRaycast(const FVector& Start, const FVector& End, 
             {
                 OutHitNormal = FVector(0, 0, Step.Z > 0 ? -1 : 1);
             }
-            
+
             return true;
         }
 
@@ -519,7 +748,7 @@ void AVoxelWorldManager::GetChunkStats(int32& OutLoadedChunks, int32& OutPending
 {
     OutLoadedChunks = LoadedChunks.Num();
     OutPendingChunks = ChunkGenerationQueue.Num() + MeshBuildQueue.Num();
-    
+
     int32 VoxelsPerChunk = WorldSettings.ChunkSize * WorldSettings.ChunkSize * WorldSettings.ChunkSize;
     OutTotalVoxels = OutLoadedChunks * VoxelsPerChunk;
 }

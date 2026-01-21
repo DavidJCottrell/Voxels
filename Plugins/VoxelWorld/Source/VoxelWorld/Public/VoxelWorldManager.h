@@ -52,6 +52,34 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel World")
     TObjectPtr<UMaterialInterface> VoxelMaterial;
 
+    // ==========================================
+    // Editor Preview Settings
+    // ==========================================
+
+    /** Enable real-time preview in editor (without pressing Play) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Editor Preview")
+    bool bEnableEditorPreview = false;
+
+    /** Preview render distance (in chunks) - keep small for editor performance */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Editor Preview", meta = (ClampMin = "1", ClampMax = "8", EditCondition = "bEnableEditorPreview"))
+    int32 EditorPreviewDistance = 3;
+
+    /** Auto-regenerate preview when settings change */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Editor Preview", meta = (EditCondition = "bEnableEditorPreview"))
+    bool bAutoRegeneratePreview = true;
+
+    /** Manually regenerate the editor preview */
+    UFUNCTION(CallInEditor, Category = "Editor Preview")
+    void RegenerateEditorPreview();
+
+    /** Clear all preview chunks */
+    UFUNCTION(CallInEditor, Category = "Editor Preview")
+    void ClearEditorPreview();
+
+    // ==========================================
+    // Runtime Functions
+    // ==========================================
+
     /** Initialize and start world generation */
     UFUNCTION(BlueprintCallable, Category = "Voxel World")
     void InitializeWorld();
@@ -95,6 +123,14 @@ public:
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+    virtual void OnConstruction(const FTransform& Transform) override;
+
+    /** Allow tick in editor for preview generation */
+    virtual bool ShouldTickIfViewportsOnly() const override;
+
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
 
     /** Terrain generator */
     UPROPERTY()
@@ -116,11 +152,17 @@ protected:
     /** Is world initialized */
     bool bIsInitialized = false;
 
+    /** Is this an editor preview (not gameplay) */
+    bool bIsEditorPreview = false;
+
     /** Create and spawn a new chunk */
     AVoxelChunk* CreateChunk(const FChunkCoord& ChunkCoord);
 
     /** Destroy a chunk */
     void DestroyChunk(const FChunkCoord& ChunkCoord);
+
+    /** Destroy all chunks */
+    void DestroyAllChunks();
 
     /** Update which chunks should be loaded based on load center */
     void UpdateChunkLoading();
@@ -139,4 +181,15 @@ protected:
 
     /** Sort chunks by distance from load center */
     void SortQueueByDistance(TArray<FChunkCoord>& Queue);
+
+    /** Get effective render distance (editor vs runtime) */
+    int32 GetEffectiveRenderDistance() const;
+
+#if WITH_EDITOR
+    /** Initialize for editor preview */
+    void InitializeEditorPreview();
+
+    /** Check if we're in editor (not playing) */
+    bool IsInEditorPreviewMode() const;
+#endif
 };
