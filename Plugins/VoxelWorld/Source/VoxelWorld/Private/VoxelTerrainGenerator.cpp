@@ -151,7 +151,7 @@ EBiomeType UVoxelTerrainGenerator::GetTerrainFeature(int32 WorldX, int32 WorldY)
 }
 
 // ==========================================
-// Cave Entrance System
+// Cave Entrance System - FIXED VERSION
 // ==========================================
 
 float UVoxelTerrainGenerator::GetCaveEntranceInfluence(int32 WorldX, int32 WorldY) const
@@ -164,7 +164,7 @@ float UVoxelTerrainGenerator::GetCaveEntranceInfluence(int32 WorldX, int32 World
 
     // Use ridged noise to create natural ravine-like entrance shapes
     // Low frequency = sparse, well-separated entrances
-    float EntranceFreq = WorldSettings.NoiseFrequency * 1.2f; // was 0.4f
+    float EntranceFreq = WorldSettings.NoiseFrequency * 1.2f;
 
     // Primary entrance noise - determines main entrance locations
     float EntranceNoise1 = NoiseGenerator->GetRidgedNoise2D(
@@ -183,8 +183,8 @@ float UVoxelTerrainGenerator::GetCaveEntranceInfluence(int32 WorldX, int32 World
     // Combine: need both high ridge AND high secondary for entrance
     float Combined = EntranceNoise1 * 0.6f + EntranceNoise2 * 0.4f;
 
-    // Very high threshold = sparse entrances (approximately 1 per 50-100 voxel area)
-    if (Combined > 0.45f) // was 0.80f
+    // Very high threshold = sparse entrances
+    if (Combined > 0.45f)
     {
         float Influence = FMath::SmoothStep(0.80f, 0.92f, Combined);
 
@@ -204,6 +204,19 @@ float UVoxelTerrainGenerator::GetCaveEntranceInfluence(int32 WorldX, int32 World
     return 0.0f;
 }
 
+// Helper function to get shaft depth parameters
+void UVoxelTerrainGenerator::GetShaftParameters(float TerrainHeight, float& OutShaftTop, float& OutShaftBottom, float& OutChamberBottom) const
+{
+    OutShaftTop = TerrainHeight - 0.5f;
+
+    // FIXED: Make shaft go much deeper - to 15% of terrain height or minimum 10
+    // This ensures we reach well into the cave zone
+    OutShaftBottom = FMath::Max(10.0f, TerrainHeight * 0.15f);
+
+    // Chamber extends even deeper to guarantee cave connection
+    OutChamberBottom = FMath::Max(5.0f, OutShaftBottom - 15.0f);
+}
+
 bool UVoxelTerrainGenerator::IsInCaveEntrance(int32 WorldX, int32 WorldY, int32 WorldZ) const
 {
     float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
@@ -211,64 +224,179 @@ bool UVoxelTerrainGenerator::IsInCaveEntrance(int32 WorldX, int32 WorldY, int32 
 
     float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
 
-    // Entrance shaft extends from near surface to cave level
-    float ShaftTop = TerrainHeight - 1.0f;
-    float ShaftBottom = FMath::Max(5.0f, TerrainHeight * 0.25f);
+    float ShaftTop, ShaftBottom, ChamberBottom;
+    GetShaftParameters(TerrainHeight, ShaftTop, ShaftBottom, ChamberBottom);
 
-    // Must be within vertical shaft range
-    if (WorldZ > ShaftTop || WorldZ < ShaftBottom) return false;
+    // Check if in vertical shaft
+    if (WorldZ <= ShaftTop && WorldZ >= ShaftBottom)
+    {
+        float DepthRatio = (ShaftTop - WorldZ) / FMath::Max(1.0f, ShaftTop - ShaftBottom);
+        float RequiredInfluence = 0.5f - DepthRatio * 0.3f;
+        if (EntranceInfluence > RequiredInfluence)
+        {
+            return true;
+        }
+    }
 
-    // The shaft gets wider as it goes deeper (inverted cone)
-    float DepthRatio = (ShaftTop - WorldZ) / FMath::Max(1.0f, ShaftTop - ShaftBottom);
-    float RequiredInfluence = 0.5f - DepthRatio * 0.3f; // Less influence needed at depth
+    // Check if in connection chamber (below shaft)
+    if (WorldZ < ShaftBottom && WorldZ >= ChamberBottom)
+    {
+        // Chamber uses lower threshold - more generous
+        if (EntranceInfluence > 0.2f)
+        {
+            return true;
+        }
+    }
 
-    return EntranceInfluence > RequiredInfluence;
+    return false;
 }
 
 float UVoxelTerrainGenerator::GetEntranceShaftDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const
 {
     float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
-    if (EntranceInfluence < 0.1f) return -1.0f; // No entrance here, return solid
+    if (EntranceInfluence < 0.1f) return -1.0f;
 
     float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
 
-    // Define shaft vertical range
-    float ShaftTop = TerrainHeight - 0.5f;  // Start just below surface for smooth transition
-    float ShaftBottom = FMath::Max(5.0f, TerrainHeight * 0.25f);
+    float ShaftTop, ShaftBottom, ChamberBottom;
+    GetShaftParameters(TerrainHeight, ShaftTop, ShaftBottom, ChamberBottom);
 
-    // Outside shaft range
+    // Above shaft - solid
     if (WorldZ > ShaftTop) return -1.0f;
-    if (WorldZ < ShaftBottom) return -1.0f;
 
-    // Calculate how deep into the shaft we are (0 = top, 1 = bottom)
-    float DepthRatio = (ShaftTop - WorldZ) / FMath::Max(1.0f, ShaftTop - ShaftBottom);
+    // Below chamber - let cave system handle it
+    if (WorldZ < ChamberBottom) return -1.0f;
 
-    // The shaft widens as it goes deeper - creates natural-looking entrance
-    // At top: need high influence (0.6) to be inside shaft
-    // At bottom: need lower influence (0.2) to be inside - wider opening
-    float RequiredInfluence = FMath::Lerp(0.55f, 0.15f, DepthRatio);
-
-    // Add vertical variation for organic tunnel walls
-    if (NoiseGenerator)
+    // ==========================================
+    // VERTICAL SHAFT (from surface to shaft bottom)
+    // ==========================================
+    if (WorldZ >= ShaftBottom)
     {
-        float WallNoise = NoiseGenerator->GetFractalNoise3D(
-            WorldX * 0.15f + 65000.0f,
-            WorldY * 0.15f + 65000.0f,
-            WorldZ * 0.08f,
+        float DepthRatio = (ShaftTop - WorldZ) / FMath::Max(1.0f, ShaftTop - ShaftBottom);
+
+        // Shaft widens as it goes deeper
+        float RequiredInfluence = FMath::Lerp(0.55f, 0.15f, DepthRatio);
+
+        // Add wall variation
+        if (NoiseGenerator)
+        {
+            float WallNoise = NoiseGenerator->GetFractalNoise3D(
+                WorldX * 0.15f + 65000.0f,
+                WorldY * 0.15f + 65000.0f,
+                WorldZ * 0.08f,
+                2, 0.5f, 2.0f
+            );
+            RequiredInfluence += (WallNoise - 0.5f) * 0.1f;
+        }
+
+        if (EntranceInfluence > RequiredInfluence)
+        {
+            float ShaftStrength = (EntranceInfluence - RequiredInfluence) * 4.0f;
+            return FMath::Min(ShaftStrength, 1.0f);
+        }
+
+        return -1.0f;
+    }
+
+    // ==========================================
+    // CONNECTION CHAMBER (below shaft, guaranteed hollow)
+    // This is the key fix - creates a guaranteed cave at shaft bottom
+    // ==========================================
+    if (WorldZ >= ChamberBottom && WorldZ < ShaftBottom)
+    {
+        // Chamber is wider than the shaft bottom
+        float ChamberRequiredInfluence = 0.12f; // Very low threshold = guaranteed chamber
+
+        // Add organic variation to chamber walls
+        if (NoiseGenerator)
+        {
+            float ChamberNoise = NoiseGenerator->GetFractalNoise3D(
+                WorldX * 0.1f + 70000.0f,
+                WorldY * 0.1f + 70000.0f,
+                WorldZ * 0.1f,
+                2, 0.5f, 2.0f
+            );
+            ChamberRequiredInfluence += (ChamberNoise - 0.5f) * 0.08f;
+        }
+
+        // The chamber gets slightly larger toward the bottom for natural look
+        float ChamberDepth = (ShaftBottom - WorldZ) / FMath::Max(1.0f, ShaftBottom - ChamberBottom);
+        ChamberRequiredInfluence -= ChamberDepth * 0.05f;
+
+        if (EntranceInfluence > ChamberRequiredInfluence)
+        {
+            float ChamberStrength = (EntranceInfluence - ChamberRequiredInfluence) * 5.0f;
+            return FMath::Min(ChamberStrength, 1.0f);
+        }
+    }
+
+    return -1.0f;
+}
+
+// NEW: Get horizontal tunnel density extending from entrance chambers
+float UVoxelTerrainGenerator::GetEntranceTunnelDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const
+{
+    if (!NoiseGenerator) return -1.0f;
+
+    float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
+    if (EntranceInfluence < 0.05f) return -1.0f;
+
+    float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
+
+    float ShaftTop, ShaftBottom, ChamberBottom;
+    GetShaftParameters(TerrainHeight, ShaftTop, ShaftBottom, ChamberBottom);
+
+    // Tunnels only form in the chamber depth range
+    if (WorldZ > ShaftBottom || WorldZ < ChamberBottom - 5) return -1.0f;
+
+    // Create radial tunnels extending outward from high-influence areas
+    // Use domain-warped noise to create winding tunnels
+    float TunnelFreq = WorldSettings.NoiseFrequency * 2.0f;
+
+    // Warp the coordinates for organic tunnel paths
+    float WarpX = NoiseGenerator->GetFractalNoise2D(
+        WorldX * TunnelFreq * 0.5f + 75000.0f,
+        WorldY * TunnelFreq * 0.5f + 75000.0f,
+        2, 0.5f, 2.0f
+    ) * 20.0f;
+
+    float WarpY = NoiseGenerator->GetFractalNoise2D(
+        WorldX * TunnelFreq * 0.5f + 76000.0f,
+        WorldY * TunnelFreq * 0.5f + 76000.0f,
+        2, 0.5f, 2.0f
+    ) * 20.0f;
+
+    // Tunnel pattern - creates branching passages
+    float TunnelNoise = NoiseGenerator->GetRidgedNoise2D(
+        (WorldX + WarpX) * TunnelFreq + 77000.0f,
+        (WorldY + WarpY) * TunnelFreq + 77000.0f,
+        2, 0.5f, 2.0f
+    );
+
+    // Tunnels form along ridges of the noise, but only near entrances
+    // The influence falloff creates tunnels that extend from entrances
+    float InfluenceFalloff = FMath::Max(0.0f, EntranceInfluence - 0.05f);
+    float TunnelThreshold = 0.75f - InfluenceFalloff * 0.5f;
+
+    if (TunnelNoise > TunnelThreshold)
+    {
+        float TunnelStrength = (TunnelNoise - TunnelThreshold) / (1.0f - TunnelThreshold);
+
+        // Vary tunnel height
+        float HeightNoise = NoiseGenerator->GetFractalNoise3D(
+            WorldX * 0.1f + 78000.0f,
+            WorldY * 0.1f + 78000.0f,
+            WorldZ * 0.2f,
             2, 0.5f, 2.0f
         );
-        RequiredInfluence += (WallNoise - 0.5f) * 0.1f;
+
+        if (HeightNoise > 0.35f)
+        {
+            return TunnelStrength * InfluenceFalloff * 3.0f;
+        }
     }
 
-    // Calculate shaft density (positive = air/carved, negative = solid)
-    if (EntranceInfluence > RequiredInfluence)
-    {
-        // Inside the shaft - return positive density (air)
-        float ShaftStrength = (EntranceInfluence - RequiredInfluence) * 4.0f;
-        return FMath::Min(ShaftStrength, 1.0f);
-    }
-
-    return -1.0f; // Outside shaft - solid
+    return -1.0f;
 }
 
 // ==========================================
@@ -645,19 +773,24 @@ float UVoxelTerrainGenerator::GetCaveDensity(int32 WorldX, int32 WorldY, int32 W
     if (!WorldSettings.bGenerateCaves || !NoiseGenerator) return -1.0f;
 
     float TerrainHeight = GetTerrainHeight(WorldX, WorldY);
-
-    // ==========================================
-    // Cave Entrance Shaft
-    // ==========================================
     float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
 
+    // ==========================================
+    // Check entrance shaft and chamber first
+    // ==========================================
     if (EntranceInfluence > 0.1f)
     {
         float ShaftDensity = GetEntranceShaftDensity(WorldX, WorldY, WorldZ);
         if (ShaftDensity > 0.0f)
         {
-            // We're inside the entrance shaft - return positive density (air)
             return ShaftDensity;
+        }
+
+        // Check horizontal tunnels extending from chambers
+        float TunnelDensity = GetEntranceTunnelDensity(WorldX, WorldY, WorldZ);
+        if (TunnelDensity > 0.0f)
+        {
+            return TunnelDensity;
         }
     }
 
@@ -665,13 +798,12 @@ float UVoxelTerrainGenerator::GetCaveDensity(int32 WorldX, int32 WorldY, int32 W
     // Regular Cave Generation
     // ==========================================
 
-    // Don't generate regular caves near surface or at bedrock
-    // EXCEPTION: Near entrance shafts, allow caves closer to surface for connectivity
-    float SurfaceMargin = 5.0f;
-    if (EntranceInfluence > 0.3f)
+    // Surface margin - how far below surface caves can form
+    float SurfaceMargin = 8.0f;
+    if (EntranceInfluence > 0.2f)
     {
-        // Near entrance: allow caves closer to surface to connect with shaft
-        SurfaceMargin = FMath::Lerp(5.0f, 2.0f, EntranceInfluence);
+        // Near entrance: allow caves much closer to surface for connectivity
+        SurfaceMargin = FMath::Lerp(8.0f, 2.0f, EntranceInfluence);
     }
 
     if (WorldZ > TerrainHeight - SurfaceMargin || WorldZ < 3) return -1.0f;
@@ -708,22 +840,29 @@ float UVoxelTerrainGenerator::GetCaveDensity(int32 WorldX, int32 WorldY, int32 W
     }
 
     // ==========================================
-    // Increase cave probability near entrance shafts
-    // This ensures caves connect to the entrance tunnels
+    // MAJOR BOOST near entrance shafts and chambers
+    // This ensures caves definitely form where entrances lead
     // ==========================================
-    if (EntranceInfluence > 0.1f)
+    if (EntranceInfluence > 0.05f)
     {
-        // Significantly lower threshold near entrances to guarantee caves form
-        float EntranceBoost = EntranceInfluence * 0.25f;
+        float ShaftTop, ShaftBottom, ChamberBottom;
+        GetShaftParameters(TerrainHeight, ShaftTop, ShaftBottom, ChamberBottom);
+
+        // Strong boost throughout the entrance zone
+        float EntranceBoost = EntranceInfluence * 0.35f;
         AdjustedThreshold -= EntranceBoost;
 
-        // Also boost caves at the bottom of entrance shafts
-        float ShaftBottom = FMath::Max(5.0f, TerrainHeight * 0.25f);
-        if (WorldZ < ShaftBottom + 10)
+        // Extra strong boost in the chamber connection zone
+        if (WorldZ <= ShaftBottom + 20 && WorldZ >= ChamberBottom - 10)
         {
-            float BottomBoost = 1.0f - ((WorldZ - ShaftBottom) / 10.0f);
-            BottomBoost = FMath::Max(0.0f, BottomBoost);
-            AdjustedThreshold -= BottomBoost * 0.15f * EntranceInfluence;
+            float ConnectionBoost = 0.25f * EntranceInfluence;
+
+            // Strongest right at chamber depth
+            float DistFromChamber = FMath::Abs(WorldZ - (ShaftBottom - 5));
+            float ProximityBoost = FMath::Max(0.0f, 1.0f - DistFromChamber / 15.0f);
+            ConnectionBoost += ProximityBoost * 0.15f;
+
+            AdjustedThreshold -= ConnectionBoost;
         }
     }
 
@@ -753,8 +892,7 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
     float TerrainDensity = (float)WorldZ - TerrainHeight;
 
     // =========================================
-    // Cave Entrance Shaft Carving
-    // Entrances must override normal terrain to create surface openings
+    // Cave Entrance Shaft and Chamber Carving
     // =========================================
     float EntranceInfluence = GetCaveEntranceInfluence(WorldX, WorldY);
     if (EntranceInfluence > 0.1f)
@@ -762,32 +900,35 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
         float ShaftDensity = GetEntranceShaftDensity(WorldX, WorldY, WorldZ);
         if (ShaftDensity > 0.0f)
         {
-            // Carve the entrance shaft through terrain
-            // Use smooth blending for natural-looking entrance
             float BlendFactor = FMath::SmoothStep(0.0f, 0.5f, ShaftDensity);
             TerrainDensity = FMath::Lerp(TerrainDensity, ShaftDensity, BlendFactor);
 
-            // Skip other processing for entrance areas - they should be open
+            TerrainDensity = FMath::Clamp(TerrainDensity / 5.0f, -1.0f, 1.0f);
+            return TerrainDensity;
+        }
+
+        // Check horizontal tunnels
+        float TunnelDensity = GetEntranceTunnelDensity(WorldX, WorldY, WorldZ);
+        if (TunnelDensity > 0.0f)
+        {
+            float BlendFactor = FMath::SmoothStep(0.0f, 0.5f, TunnelDensity);
+            TerrainDensity = FMath::Lerp(TerrainDensity, TunnelDensity, BlendFactor);
+
             TerrainDensity = FMath::Clamp(TerrainDensity / 5.0f, -1.0f, 1.0f);
             return TerrainDensity;
         }
     }
 
     // =========================================
-    // NO 3D variation - it causes holes
+    // Cave generation
     // =========================================
+    const float CaveSurfaceMargin = 15.0f;
+    const float CaveDensityThreshold = -0.6f;
 
-    // =========================================
-    // Cave generation (conservative settings)
-    // =========================================
-    const float CaveSurfaceMargin = 20.0f;  // Very conservative
-    const float CaveDensityThreshold = -0.8f;  // Only carve very solid areas
-
-    // Adjust cave margin near entrances for connectivity
     float EffectiveCaveMargin = CaveSurfaceMargin;
-    if (EntranceInfluence > 0.2f)
+    if (EntranceInfluence > 0.15f)
     {
-        EffectiveCaveMargin = FMath::Lerp(CaveSurfaceMargin, 5.0f, EntranceInfluence);
+        EffectiveCaveMargin = FMath::Lerp(CaveSurfaceMargin, 3.0f, EntranceInfluence);
     }
 
     if (WorldSettings.bGenerateCaves &&
@@ -818,10 +959,9 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
     }
 
     // =========================================
-    // BULLETPROOF THICKNESS CHECK
-    // Skip for entrance areas - they need to be hollow
+    // Thickness check (skip for entrance areas)
     // =========================================
-    if (EntranceInfluence < 0.3f)
+    if (EntranceInfluence < 0.2f)
     {
         const float MinSolidThicknessPreNorm = 1.0f;
         if (TerrainDensity < 0.0f && TerrainDensity > -MinSolidThicknessPreNorm)
@@ -833,11 +973,8 @@ float UVoxelTerrainGenerator::GetDensity(int32 WorldX, int32 WorldY, int32 World
     // Normalize density
     TerrainDensity = FMath::Clamp(TerrainDensity / 5.0f, -1.0f, 1.0f);
 
-    // =========================================
-    // POST-NORMALIZATION SAFETY CHECK
-    // Skip for entrance areas
-    // =========================================
-    if (EntranceInfluence < 0.3f)
+    // Post-normalization safety check (skip for entrance areas)
+    if (EntranceInfluence < 0.2f)
     {
         if (TerrainDensity > -0.15f && TerrainDensity < 0.15f)
         {

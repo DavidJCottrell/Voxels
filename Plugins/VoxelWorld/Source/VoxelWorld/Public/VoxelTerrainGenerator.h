@@ -12,7 +12,7 @@ class UVoxelNoiseGenerator;
 /**
  * Terrain generator for voxel worlds using Signed Distance Fields
  * Produces smooth terrain data for Marching Cubes mesh generation
- * Features: Plateaus, Deep Valleys, Canyons, Cave Entrances, and varied biomes
+ * Features: Plateaus, Deep Valleys, Canyons, Cave Entrances with guaranteed connections, and varied biomes
  */
 UCLASS(BlueprintType, Blueprintable, EditInlineNew, DefaultToInstanced)
 class VOXELWORLD_API UVoxelTerrainGenerator : public UObject
@@ -99,6 +99,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Terrain|Caves")
     float GetEntranceShaftDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const;
 
+    /** Get horizontal tunnel density extending from entrance chambers */
+    UFUNCTION(BlueprintCallable, Category = "Terrain|Caves")
+    float GetEntranceTunnelDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const;
+
     /** Check if a chunk is likely to be empty (for optimization) */
     UFUNCTION(BlueprintCallable, Category = "Terrain|Optimization")
     bool IsChunkLikelyEmpty(int32 ChunkX, int32 ChunkY, int32 ChunkZ, int32 ChunkSize) const;
@@ -126,6 +130,13 @@ protected:
 
     /** Get 3D terrain density variation for overhangs and caves */
     float Get3DTerrainVariation(int32 WorldX, int32 WorldY, int32 WorldZ) const;
+
+    // ==========================================
+    // Cave Entrance Helpers
+    // ==========================================
+
+    /** Get shaft vertical parameters (top, bottom, chamber bottom) */
+    void GetShaftParameters(float TerrainHeight, float& OutShaftTop, float& OutShaftBottom, float& OutChamberBottom) const;
 
     // ==========================================
     // Biome Feature Generation
