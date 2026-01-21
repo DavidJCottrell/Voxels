@@ -3,7 +3,37 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "ProceduralMeshComponent.h"
 #include "VoxelTypes.generated.h"
+
+/** Mesh data structure for chunk generation */
+USTRUCT()
+struct VOXELWORLD_API FVoxelMeshData
+{
+    GENERATED_BODY()
+
+    TArray<FVector> Vertices;
+    TArray<int32> Triangles;
+    TArray<FVector> Normals;
+    TArray<FVector2D> UVs;
+    TArray<FColor> VertexColors;
+    TArray<FProcMeshTangent> Tangents;
+
+    void Reset()
+    {
+        Vertices.Empty();
+        Triangles.Empty();
+        Normals.Empty();
+        UVs.Empty();
+        VertexColors.Empty();
+        Tangents.Empty();
+    }
+
+    bool IsEmpty() const
+    {
+        return Vertices.Num() == 0;
+    }
+};
 
 /** Enumeration for different voxel/block types */
 UENUM(BlueprintType)
@@ -21,7 +51,7 @@ enum class EVoxelType : uint8
     Clay = 9        UMETA(DisplayName = "Clay"),
     Ice = 10        UMETA(DisplayName = "Ice"),
     Lava = 11       UMETA(DisplayName = "Lava"),
-    
+
     Max UMETA(Hidden)
 };
 
@@ -34,14 +64,19 @@ struct VOXELWORLD_API FVoxel
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel")
     EVoxelType Type = EVoxelType::Air;
 
+    /**
+     * Density value for smooth terrain
+     * For blocky terrain: 0 = empty, 255 = fully solid
+     * For smooth terrain: maps to SDF value where 127 = surface
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel")
-    uint8 Density = 0; // 0 = fully empty, 255 = fully solid (for smooth terrain)
+    uint8 Density = 0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel")
     uint8 LightLevel = 0;
 
     FVoxel() = default;
-    
+
     FVoxel(EVoxelType InType, uint8 InDensity = 255)
         : Type(InType), Density(InDensity), LightLevel(0)
     {
@@ -138,7 +173,7 @@ enum class EBiomeType : uint8
     Tundra = 4      UMETA(DisplayName = "Tundra"),
     Ocean = 5       UMETA(DisplayName = "Ocean"),
     Swamp = 6       UMETA(DisplayName = "Swamp"),
-    
+
     Max UMETA(Hidden)
 };
 
@@ -199,4 +234,13 @@ struct VOXELWORLD_API FVoxelWorldSettings
     /** Number of chunks to generate per frame */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Performance", meta = (ClampMin = "1", ClampMax = "16"))
     int32 ChunksPerFrame = 4;
+
+    /**
+     * Terrain smoothness - affects how much 3D noise influences terrain
+     * Higher values create more overhangs and varied terrain
+     * 0 = minimal overhangs (more like traditional heightmap)
+     * 1 = maximum 3D variation (more caves and overhangs)
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Generation", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float TerrainSmoothness = 0.5f;
 };

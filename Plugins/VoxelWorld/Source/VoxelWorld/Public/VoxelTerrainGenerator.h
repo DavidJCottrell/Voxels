@@ -10,8 +10,8 @@
 class UVoxelNoiseGenerator;
 
 /**
- * Terrain generator for voxel worlds
- * Handles biome distribution, terrain shaping, and feature placement
+ * Terrain generator for voxel worlds using Signed Distance Fields
+ * Produces smooth terrain data for Marching Cubes mesh generation
  */
 UCLASS(BlueprintType, Blueprintable, EditInlineNew, DefaultToInstanced)
 class VOXELWORLD_API UVoxelTerrainGenerator : public UObject
@@ -25,15 +25,24 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Terrain")
     void Initialize(const FVoxelWorldSettings& Settings);
 
+    /**
+     * Get density value at world position (Signed Distance Field)
+     * Negative = inside terrain (solid)
+     * Positive = outside terrain (air)
+     * Zero = exactly on surface
+     */
+    UFUNCTION(BlueprintCallable, Category = "Terrain")
+    float GetDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const;
+
     /** Generate terrain height at a given world position */
     UFUNCTION(BlueprintCallable, Category = "Terrain")
-    int32 GetTerrainHeight(int32 WorldX, int32 WorldY) const;
+    float GetTerrainHeight(int32 WorldX, int32 WorldY) const;
 
     /** Get the biome at a given position */
     UFUNCTION(BlueprintCallable, Category = "Terrain")
     EBiomeType GetBiome(int32 WorldX, int32 WorldY) const;
 
-    /** Get the voxel type at a given world position */
+    /** Get the voxel/material type at a given world position */
     UFUNCTION(BlueprintCallable, Category = "Terrain")
     EVoxelType GetVoxelType(int32 WorldX, int32 WorldY, int32 WorldZ) const;
 
@@ -41,9 +50,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Terrain")
     bool IsCave(int32 WorldX, int32 WorldY, int32 WorldZ) const;
 
-    /** Generate an entire chunk's voxel data */
+    /** Get cave density (for smooth cave walls) */
     UFUNCTION(BlueprintCallable, Category = "Terrain")
-    void GenerateChunkData(const FChunkCoord& ChunkCoord, TArray<FVoxel>& OutVoxelData) const;
+    float GetCaveDensity(int32 WorldX, int32 WorldY, int32 WorldZ) const;
 
     /** Get temperature value at position (0-1) */
     UFUNCTION(BlueprintCallable, Category = "Terrain")
@@ -61,18 +70,21 @@ protected:
     /** Cached world settings */
     FVoxelWorldSettings WorldSettings;
 
-    /** Get continentalness (land vs ocean) */
+    /** Get continentalness (land vs ocean) - affects base terrain height */
     float GetContinentalness(int32 WorldX, int32 WorldY) const;
 
-    /** Get erosion factor */
+    /** Get erosion factor - affects terrain smoothness */
     float GetErosion(int32 WorldX, int32 WorldY) const;
 
-    /** Get peaks and valleys factor */
+    /** Get peaks and valleys factor - creates mountain ridges */
     float GetPeaksValleys(int32 WorldX, int32 WorldY) const;
 
-    /** Determine surface block based on biome and conditions */
-    EVoxelType GetSurfaceBlock(EBiomeType Biome, int32 WorldX, int32 WorldY, int32 WorldZ, int32 TerrainHeight) const;
+    /** Get 3D terrain density variation for overhangs and caves */
+    float Get3DTerrainVariation(int32 WorldX, int32 WorldY, int32 WorldZ) const;
 
-    /** Determine underground block based on depth and conditions */
-    EVoxelType GetUndergroundBlock(int32 WorldZ, int32 TerrainHeight, EBiomeType Biome) const;
+    /** Determine surface material based on biome and conditions */
+    EVoxelType GetSurfaceBlock(EBiomeType Biome, int32 WorldX, int32 WorldY, int32 WorldZ, float TerrainHeight) const;
+
+    /** Determine underground material based on depth and conditions */
+    EVoxelType GetUndergroundBlock(int32 WorldZ, float TerrainHeight, EBiomeType Biome) const;
 };

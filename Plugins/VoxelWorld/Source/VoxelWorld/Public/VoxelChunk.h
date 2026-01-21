@@ -1,47 +1,19 @@
-// Copyright Your Company. All Rights Reserved.
-
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "ProceduralMeshComponent.h"
 #include "VoxelTypes.h"
+#include "VoxelMarchingCubes.h"
 #include "VoxelChunk.generated.h"
 
 class UVoxelTerrainGenerator;
 
-/** Mesh data structure for chunk generation */
-USTRUCT()
-struct FVoxelMeshData
-{
-    GENERATED_BODY()
-
-    TArray<FVector> Vertices;
-    TArray<int32> Triangles;
-    TArray<FVector> Normals;
-    TArray<FVector2D> UVs;
-    TArray<FColor> VertexColors;
-    TArray<FProcMeshTangent> Tangents;
-
-    void Reset()
-    {
-        Vertices.Empty();
-        Triangles.Empty();
-        Normals.Empty();
-        UVs.Empty();
-        VertexColors.Empty();
-        Tangents.Empty();
-    }
-
-    bool IsEmpty() const
-    {
-        return Vertices.Num() == 0;
-    }
-};
+// Include full definition for TUniquePtr to work correctly
 
 /**
  * Represents a single chunk in the voxel world
- * Handles voxel storage and mesh generation
+ * Supports both blocky and smooth (Marching Cubes) mesh generation
  */
 UCLASS()
 class VOXELWORLD_API AVoxelChunk : public AActor
@@ -50,6 +22,9 @@ class VOXELWORLD_API AVoxelChunk : public AActor
 
 public:
     AVoxelChunk();
+
+    // Destructor must be defined in .cpp where FVoxelMarchingCubes is complete
+    ~AVoxelChunk();
 
     /** Initialize the chunk with coordinates and settings */
     UFUNCTION(BlueprintCallable, Category = "Voxel")
@@ -71,6 +46,26 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Voxel")
     void SetVoxel(int32 LocalX, int32 LocalY, int32 LocalZ, const FVoxel& Voxel);
 
+    /** Get density at local position (for smooth terrain) */
+    UFUNCTION(BlueprintCallable, Category = "Voxel")
+    float GetDensity(int32 LocalX, int32 LocalY, int32 LocalZ) const;
+
+    /** Set density at local position (for smooth terrain editing) */
+    UFUNCTION(BlueprintCallable, Category = "Voxel")
+    void SetDensity(int32 LocalX, int32 LocalY, int32 LocalZ, float Density);
+
+    /** Modify terrain smoothly - adds/removes material in a sphere */
+    UFUNCTION(BlueprintCallable, Category = "Voxel")
+    void ModifyTerrain(const FVector& LocalPosition, float Radius, float Strength, bool bAdd);
+
+    /** Get material type at local position */
+    UFUNCTION(BlueprintCallable, Category = "Voxel")
+    EVoxelType GetMaterial(int32 LocalX, int32 LocalY, int32 LocalZ) const;
+
+    /** Set material type at local position */
+    UFUNCTION(BlueprintCallable, Category = "Voxel")
+    void SetMaterial(int32 LocalX, int32 LocalY, int32 LocalZ, EVoxelType Material);
+
     /** Get chunk coordinate */
     UFUNCTION(BlueprintCallable, Category = "Voxel")
     FChunkCoord GetChunkCoord() const { return ChunkCoord; }
@@ -90,6 +85,12 @@ public:
     /** Set neighbor chunks for seamless mesh generation */
     void SetNeighbors(AVoxelChunk* XPos, AVoxelChunk* XNeg, AVoxelChunk* YPos, AVoxelChunk* YNeg, AVoxelChunk* ZPos, AVoxelChunk* ZNeg);
 
+    /** Get density from this chunk or neighbors (used by marching cubes) */
+    float GetDensityIncludingNeighbors(int32 LocalX, int32 LocalY, int32 LocalZ) const;
+
+    /** Get material from this chunk or neighbors */
+    EVoxelType GetMaterialIncludingNeighbors(int32 LocalX, int32 LocalY, int32 LocalZ) const;
+
 protected:
     virtual void BeginPlay() override;
 
@@ -108,8 +109,22 @@ protected:
     UPROPERTY()
     TObjectPtr<UVoxelTerrainGenerator> TerrainGenerator;
 
-    /** Voxel data storage */
-    TArray<FVoxel> VoxelData;
+    /**
+     * Density data for smooth terrain (Signed Distance Field)
+     * Values < 0 are inside terrain (solid)
+     * Values > 0 are outside terrain (air)
+     * Size is (ChunkSize+1)^3 to include boundary samples for interpolation
+     */
+    TArray<float> DensityData;
+
+    /**
+     * Material data - stores the material type for each voxel
+     * Size is ChunkSize^3
+     */
+    TArray<EVoxelType> MaterialData;
+
+    /** Marching cubes mesher instance */
+    TUniquePtr<FVoxelMarchingCubes> MarchingCubes;
 
     /** Neighbor chunk references */
     TWeakObjectPtr<AVoxelChunk> NeighborXPos;
@@ -123,8 +138,15 @@ protected:
     bool bIsGenerated = false;
     bool bNeedsMeshRebuild = false;
 
-    /** Convert local coordinates to array index */
-    FORCEINLINE int32 GetVoxelIndex(int32 X, int32 Y, int32 Z) const
+    /** Convert local coordinates to density array index (ChunkSize+1 grid) */
+    FORCEINLINE int32 GetDensityIndex(int32 X, int32 Y, int32 Z) const
+    {
+        int32 Size = WorldSettings.ChunkSize + 1;
+        return X + Y * Size + Z * Size * Size;
+    }
+
+    /** Convert local coordinates to material array index (ChunkSize grid) */
+    FORCEINLINE int32 GetMaterialIndex(int32 X, int32 Y, int32 Z) const
     {
         return X + Y * WorldSettings.ChunkSize + Z * WorldSettings.ChunkSize * WorldSettings.ChunkSize;
     }
@@ -137,14 +159,13 @@ protected:
                Z >= 0 && Z < WorldSettings.ChunkSize;
     }
 
-    /** Get voxel from this chunk or neighbor */
-    FVoxel GetVoxelIncludingNeighbors(int32 LocalX, int32 LocalY, int32 LocalZ) const;
-
-    /** Check if a face should be rendered (adjacent voxel is transparent) */
-    bool ShouldRenderFace(int32 LocalX, int32 LocalY, int32 LocalZ, int32 DirX, int32 DirY, int32 DirZ) const;
-
-    /** Add a face to mesh data */
-    void AddFace(FVoxelMeshData& MeshData, const FVector& Position, int32 FaceIndex, EVoxelType VoxelType) const;
+    /** Check if coordinates are valid for density grid (includes +1 boundary) */
+    FORCEINLINE bool IsInDensityBounds(int32 X, int32 Y, int32 Z) const
+    {
+        return X >= 0 && X <= WorldSettings.ChunkSize &&
+               Y >= 0 && Y <= WorldSettings.ChunkSize &&
+               Z >= 0 && Z <= WorldSettings.ChunkSize;
+    }
 
     /** Get color for voxel type */
     FColor GetVoxelColor(EVoxelType Type) const;
